@@ -284,14 +284,14 @@ import {libWrapper} from './shim.js';
 			}
 			
 		
-			Hooks.on("getCompendiumDirectoryEntryContext", async (html, options) => {
+			Hooks.on("getCompendiumContextOptions", async (html, options) => {
 				options.push( 
 					{
 					  name : "(TA)Export to JSON",
 					  condition: game.user.isGM,
 					  icon: '<i class="fas fa-file-export"></i>',
-					  callback: target => {
-						let pack = game.packs.get(target[0].dataset.pack);
+					  callback: (target) => {
+						let pack = game.packs.get(target.dataset.pack);
 						if(pack.metadata.type !== "Actor") return ui.notifications.error(game.i18n.format(localizedStrings.error.ExportAllowsOnlyActor));
 						TokenAttacher.exportCompendiumToJSON(pack);
 					  }
@@ -747,7 +747,12 @@ import {libWrapper} from './shim.js';
 				//return update;
 			}
 			//Rectangle Entities
-			else if(('shape' in objData && 'width' in objData.shape) || 'width' in objData || 'distance' in objData || 'dim' in objData || (objData.hasOwnProperty('config') && 'dim' in objData.config) || 'radius' in objData){
+			else if(('shape' in objData && typeof objData.shape === 'object' && 'width' in objData.shape) 
+					|| 'width' in objData 
+					|| 'distance' in objData 
+					|| 'dim' in objData 
+					|| (objData.hasOwnProperty('config') && 'dim' in objData.config) 
+					|| 'radius' in objData){
 				const [x,y,rotation] =TokenAttacher.moveRotateRectangle(objData, offset, baseOffset.center, baseOffset.rotation, size_multi);
 				update.x = x;
 				update.y = y;
@@ -1072,27 +1077,24 @@ import {libWrapper} from './shim.js';
 		 * Hook into the toolbar and add buttons 
 		 */
 		static _getControlButtons(controls){
-			for (let i = 0; i < controls.length; i++) {
-				if(controls[i].name === "token"){
-					controls[i].tools.push({
-						name: "TAStartTokenAttach",
-						title: game.i18n.format(localizedStrings.button.StartTokenAttach),
-						icon: "fas fa-link",
-						visible: game.user.isGM,
-						onClick: () => TokenAttacher._StartTokenAttach(canvas.tokens.controlled[0]),
-						button: true
-					  });
-					controls[i].tools.push({
-						name: "TAToggleQuickEdit",
-						title: game.i18n.format(localizedStrings.button.ToggleQuickEditMode),
-						icon: "fas fa-feather-alt",
-						visible: game.user.isGM,
-						onClick: () => TokenAttacher.toggleQuickEditMode(),
-						toggle: true,
-						active: foundry.utils.getProperty(window, 'tokenAttacher.quickEdit') ?? false,
-					});
-				}
-			}
+			const tokens = controls.tokens;
+			tokens.tools['TAStartTokenAttach'] = {
+				name: "TAStartTokenAttach",
+				title: game.i18n.format(localizedStrings.button.StartTokenAttach),
+				icon: "fas fa-link",
+				visible: game.user.isGM,
+				onClick: () => TokenAttacher._StartTokenAttach(canvas.tokens.controlled[0]),
+				button: true
+				};
+			tokens.tools['TAToggleQuickEdit'] = {
+				name: "TAToggleQuickEdit",
+				title: game.i18n.format(localizedStrings.button.ToggleQuickEditMode),
+				icon: "fas fa-feather-alt",
+				visible: game.user.isGM,
+				onClick: () => TokenAttacher.toggleQuickEditMode(),
+				toggle: true,
+				active: foundry.utils.getProperty(window, 'tokenAttacher.quickEdit') ?? false,
+			};
 			console.log("Token Attacher | Tools added.");
 		}
 
@@ -1162,7 +1164,7 @@ import {libWrapper} from './shim.js';
 			await canvas.scene.setFlag(moduleName, "attach_base", {type:token.layer.constructor.documentName, element:token.document._id});
 			const locked_status = token.document.getFlag(moduleName, "locked") || false;
 			// Get the handlebars output
-			const myHtml = await renderTemplate(`${templatePath}/tokenAttacherUI.html`, {["token-image"]: token.document.texture.src, ["token-name"]: token.document.name});
+			const myHtml = await foundry.applications.handlebars.renderTemplate(`${templatePath}/tokenAttacherUI.html`, {["token-image"]: token.document.texture.src, ["token-name"]: token.document.name});
 
 			window.document.getElementById("hud").insertAdjacentHTML('afterend', myHtml);
 
@@ -2119,7 +2121,7 @@ import {libWrapper} from './shim.js';
 					addParentFolder(folders, folder);
 				}
 			});
-			const html = await renderTemplate(`${templatePath}/ImExportUI.html`, {label_content:"Copy the JSON below:", content:JSON.stringify({folder: folders, actors: allMappedActors, ['data-model']: game.settings.get(moduleName, "data-model-version")})});
+			const html = await foundry.applications.handlebars.renderTemplate(`${templatePath}/ImExportUI.html`, {label_content:"Copy the JSON below:", content:JSON.stringify({folder: folders, actors: allMappedActors, ['data-model']: game.settings.get(moduleName, "data-model-version")})});
 			Dialog.prompt({title:"Export Actors to JSON", callback: html => {}, content: html});
 		}
 
@@ -2174,7 +2176,7 @@ import {libWrapper} from './shim.js';
 				}
 			});
 
-			const html = await renderTemplate(`${templatePath}/ImExportUI.html`, {label_content:"Copy the JSON below:", content:JSON.stringify({
+			const html = await foundry.applications.handlebars.renderTemplate(`${templatePath}/ImExportUI.html`, {label_content:"Copy the JSON below:", content:JSON.stringify({
 				compendium: {
 					name:pack.metadata.name, 
 					label:pack.metadata.label,
@@ -2189,7 +2191,7 @@ import {libWrapper} from './shim.js';
 		}
 
 		static async importFromJSONDialog(){
-			const html = await renderTemplate(`${templatePath}/ImExportUI.html`, {label_content:"Paste JSON below:", content:""});
+			const html = await foundry.applications.handlebars.renderTemplate(`${templatePath}/ImExportUI.html`, {label_content:"Paste JSON below:", content:""});
 			Dialog.prompt({title:"Import Actors from JSON", 
 			content: html,
 			callback: html => {
@@ -2824,7 +2826,7 @@ import {libWrapper} from './shim.js';
 				}
 				if(window.document.getElementById("tokenAttacherQuickEdit")) return;
 				// Get the handlebars output
-				const myHtml = await renderTemplate(`${templatePath}/QuickEdit.html`, {});
+				const myHtml = await foundry.applications.handlebars.renderTemplate(`${templatePath}/QuickEdit.html`, {});
 
 				window.document.getElementById("pause").insertAdjacentHTML('afterend', myHtml);
 
