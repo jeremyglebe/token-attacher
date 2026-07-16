@@ -57,7 +57,7 @@
 		//Legacy code
 		if(offset.elevation?.flags?.wallHeight?.hasOwnProperty('wallHeightBottom') || offset.elevation?.flags?.wallHeight?.hasOwnProperty('wallHeightTop')){
 			const wallHeightModule = game.modules.get(moduleName) ?? {version:0};
-			if(isNewerVersion("4.0", wallHeightModule.version)){
+			if(foundry.utils.isNewerVersion("4.0", wallHeightModule.version)){
 				if([null, Infinity, -Infinity].includes(offset.elevation?.flags?.wallHeight?.wallHeightBottom) === false) update['flags.wallHeight.wallHeightBottom'] = baseOffset.elevation + offset.elevation.flags.wallHeight.wallHeightBottom;
 				if([null, Infinity, -Infinity].includes(offset.elevation?.flags?.wallHeight?.wallHeightTop) === false) update['flags.wallHeight.wallHeightTop'] = baseOffset.elevation + offset.elevation.flags.wallHeight.wallHeightTop;
 			}else{

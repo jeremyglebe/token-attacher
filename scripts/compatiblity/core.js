@@ -3,13 +3,65 @@
 //TODO: Refactor out the rest of the core PlacableObjects logic into this file
 (async () => {
 	const moduleNameTA = "token-attacher";
+	const isV14 = () => (game.release?.generation ?? 0) >= 14;
+
+	function createV14Shape(shapeData){
+		const ShapeData = foundry.data.BaseShapeData.TYPES[shapeData.type];
+		return ShapeData ? new ShapeData(shapeData, {parent: canvas.scene}) : null;
+	}
+
+	function scaleV14Shape(shape, scaleX, scaleY, origin, scaleToken=true){
+		scaleX = Number.isFinite(scaleX) ? scaleX : 1;
+		scaleY = Number.isFinite(scaleY) ? scaleY : 1;
+		const scaleRadius = (Math.abs(scaleX) + Math.abs(scaleY)) / 2;
+		switch(shape.type){
+			case "rectangle":
+				shape.width *= scaleX;
+				shape.height *= scaleY;
+				break;
+			case "circle":
+			case "cone":
+				shape.radius *= scaleRadius;
+				break;
+			case "ellipse":
+				shape.radiusX *= scaleX;
+				shape.radiusY *= scaleY;
+				break;
+			case "ring":
+				shape.radius *= scaleRadius;
+				shape.innerWidth *= scaleRadius;
+				shape.outerWidth *= scaleRadius;
+				break;
+			case "line":
+				shape.length *= scaleX;
+				shape.width *= scaleY;
+				break;
+			case "polygon":
+				if(origin && Array.isArray(shape.points)){
+					for(let i = 0; i < shape.points.length; i += 2){
+						shape.points[i] = origin.x + ((shape.points[i] - origin.x) * scaleX);
+						shape.points[i + 1] = origin.y + ((shape.points[i + 1] - origin.y) * scaleY);
+					}
+				}
+				break;
+			case "token":
+				if(scaleToken){
+					shape.width *= scaleX;
+					shape.height *= scaleY;
+				}
+				break;
+			case "emanation":
+				shape.radius *= scaleRadius;
+				if(shape.base) scaleV14Shape(shape.base, scaleX, scaleY, origin, scaleToken);
+				break;
+		}
+		return shape;
+	}
 
 	function doAttachmentsNeedUpdate(document, change, options, userId){
 		if(foundry.utils.getProperty(options, `${moduleNameTA}.attachmentsNeedUpdate`)) return;
 
-		if(!(change.elevation?.rangeBottom)
-			|| (change.elevation?.rangeTop)
-		) return;
+		if(!change.elevation || !(Object.hasOwn(change.elevation, "bottom") || Object.hasOwn(change.elevation, "top"))) return;
 
 		foundry.utils.setProperty(options, `${moduleNameTA}.attachmentsNeedUpdate`, true);
 	}
@@ -32,7 +84,24 @@
 			offset.shapes = [];
 			for (let i = 0; i < objData.shapes.length; i++) {
 				const shape = objData.shapes[i];
-				offset.shapes[i] = foundry.utils.duplicate(shape);				
+				offset.shapes[i] = foundry.utils.duplicate(shape);
+				if(isV14()){
+					try {
+						const shapeModel = createV14Shape(shape);
+						if(shapeModel){
+							offset.shapes[i]._taOrigin = {
+								x: shapeModel.origin.x - baseCenter.x,
+								y: shapeModel.origin.y - baseCenter.y
+							};
+							offset.shapes[i]._taShapeOrigin = {x: shapeModel.origin.x, y: shapeModel.origin.y};
+							offset.shapes[i]._taBaseRotation = baseRotation ?? 0;
+							continue;
+						}
+					}
+					catch(error){
+						console.warn("Token Attacher | Could not store a V14 Region shape offset.", error);
+					}
+				}
 				switch (shape.type) {
 					case 'rectangle':
 						offset.shapes[i].width = shape.width;
@@ -71,7 +140,7 @@
 
 		let  baseElevation = baseDoc.elevation?.bottom ?? baseDoc.elevation ?? baseDoc.flags['levels']?.elevation ?? baseDoc.flags['levels']?.rangeBottom ?? baseDoc.flags['wallHeight']?.wallHeightBottom ?? baseDoc.flags['wall-height']?.bottom ?? 0;
 
-		if(objData.elevation?.top || objData.elevation?.bottom){
+		if(objData.elevation && (Object.hasOwn(objData.elevation, "top") || Object.hasOwn(objData.elevation, "bottom"))){
 			offset.elevation = offset.elevation ?? {};
 			offset.elevation.top = objData.elevation.top ?? null;
 			offset.elevation.bottom = objData.elevation.bottom ?? null;
@@ -94,6 +163,35 @@
 			for (let i = 0; i < offset.shapes.length; i++) {
 				const shapeOffset = offset.shapes[i];	
 				let x,y;	
+				if(isV14() && shapeOffset._taOrigin){
+					try {
+						const {
+							_taOrigin,
+							_taShapeOrigin,
+							_taBaseRotation,
+							_taSkipGridScale,
+							...shapeData
+						} = foundry.utils.duplicate(shapeOffset);
+						scaleV14Shape(shapeData, size_multi.w, size_multi.h, _taShapeOrigin);
+						const shapeModel = createV14Shape(shapeData);
+						if(shapeModel){
+							const deltaRotation = (baseRotation ?? 0) - (_taBaseRotation ?? 0);
+							const a = Math.toRadians(deltaRotation);
+							const dx = _taOrigin.x * size_multi.w;
+							const dy = _taOrigin.y * size_multi.h;
+							shapeModel.move({
+								x: baseOffset.center.x + ((Math.cos(a) * dx) - (Math.sin(a) * dy)),
+								y: baseOffset.center.y + ((Math.sin(a) * dx) + (Math.cos(a) * dy))
+							});
+							if(deltaRotation) shapeModel.rotate(deltaRotation);
+							shapes[i] = shapeModel.toObject();
+							continue;
+						}
+					}
+					catch(error){
+						console.warn("Token Attacher | Could not position a V14 Region shape.", error);
+					}
+				}
 				switch (shapeOffset.type) {
 					case 'rectangle':
 						shapes[i].width = shapeOffset.width * size_multi.w;
@@ -146,11 +244,13 @@
 			update[`shapes`] = shapes;
 		}
 
-		if(offset.elevation?.top){
-			if([null, Infinity, -Infinity].includes(offset.elevation?.top) === false) update[`elevation.top`] = baseOffset.elevation + offset.elevation?.top;
-		}
-		if(offset.elevation?.bottom){
-			if([null, Infinity, -Infinity].includes(offset.elevation?.bottom) === false) update[`elevation.bottom`] = baseOffset.elevation + offset.elevation?.bottom;
+		if(offset.elevation && (Object.hasOwn(offset.elevation, "top") || Object.hasOwn(offset.elevation, "bottom"))){
+			update.elevation = foundry.utils.duplicate(objData.elevation || {});
+			for(const key of ["bottom", "top"]){
+				if(!Object.hasOwn(offset.elevation, key)) continue;
+				const value = offset.elevation[key];
+				update.elevation[key] = [null, Infinity, -Infinity].includes(value) ? value : baseOffset.elevation + value;
+			}
 		}
 	}
 
@@ -163,6 +263,14 @@
 			const shapes = offset.shapes;	
 			for (let i = 0; i < shapes.length; i++) {
 				const shapeOffset = shapes[i];	
+				if(isV14() && shapeOffset._taOrigin){
+					shapeOffset._taOrigin.x *= grid_multi.sizeX;
+					shapeOffset._taOrigin.y *= grid_multi.sizeY;
+					if(!shapeOffset._taSkipGridScale){
+						scaleV14Shape(shapeOffset, grid_multi.sizeX, grid_multi.sizeY, shapeOffset._taShapeOrigin, false);
+					}
+					continue;
+				}
 				switch (shapeOffset.type) {
 					case 'rectangle':
 						shapes[i].width  *= grid_multi.sizeX;
@@ -178,9 +286,9 @@
 						break;	
 					case 'polygon':								
 						const points = shapes[i].points;
-						for (let j = 0; j < points.length; j+=2) {
-							points[j] 	*= grid_multi.sizeX;
-							points[j+1] *= grid_multi.sizeY;					
+						for (let j = 0; j < points.length; j++) {
+							points[j][0] *= grid_multi.sizeX;
+							points[j][1] *= grid_multi.sizeY;
 						}
 						break;
 					default:

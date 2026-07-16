@@ -1,5 +1,8 @@
 <div id="tokenAttacher" class="flexrow">
-    <div class="app image" style="background-image:url({{token-image}});"><span class="token-name"><span>{{token-name}}</span></span></div>
+    <div class="app image"{{#unless token-video}} style="background-image:url({{token-image}});"{{/unless}}>
+        {{#if token-video}}<video src="{{token-image}}" autoplay loop muted playsinline></video>{{/if}}
+        <span class="token-name"><span>{{token-name}}</span></span>
+    </div>
     <ol class="control-tools flexcol">
         <li class="control-tool select" title="{{localize "TOKENATTACHER.button.select"}}">
             <i class="fas fa-expand"></i>

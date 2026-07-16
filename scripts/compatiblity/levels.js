@@ -23,7 +23,7 @@
 	// }
 
 	function getElementOffset(type, objData, base_type, baseDoc, grid, offset){
-		if(!["Drawings","Tile", "AmbientLight", "AmbientSound"].includes(type)) return;
+		if(!["Drawing","Tile", "AmbientLight", "AmbientSound"].includes(type)) return;
 		
 		let  base_elevation = baseDoc.elevation ?? baseDoc.flags[moduleName]?.elevation ?? baseDoc.flags[moduleName]?.rangeBottom ?? baseDoc.flags['wallHeight']?.wallHeightBottom ?? baseDoc.flags['wall-height']?.bottom ?? 0;
 		
@@ -36,15 +36,17 @@
 		}
 		if(objData.flags[moduleName]?.hasOwnProperty('rangeTop') || objData.flags[moduleName]?.hasOwnProperty('rangeBottom')){
 			offset.elevation.flags[moduleName] = {
-				rangeTop:objData.flags[moduleName].rangeTop ?? null
+				rangeTop:objData.flags[moduleName].rangeTop ?? null,
+				rangeBottom:objData.flags[moduleName].rangeBottom ?? null
 			};
 			
 			if([null, Infinity, -Infinity].includes(offset.elevation.flags[moduleName].rangeTop) === false) offset.elevation.flags[moduleName].rangeTop -= base_elevation;
+			if([null, Infinity, -Infinity].includes(offset.elevation.flags[moduleName].rangeBottom) === false) offset.elevation.flags[moduleName].rangeBottom -= base_elevation;
 		}
 	}
 	
 	function offsetPositionOfElement(type, objData, baseType, baseData, baseOffset, grid_multi, update){
-		if(!["Drawings","Tile", "AmbientLight", "AmbientSound"].includes(type)) return;
+		if(!["Drawing","Tile", "AmbientLight", "AmbientSound"].includes(type)) return;
 		
 		const offset = foundry.utils.getProperty(objData, `flags.${moduleNameTA}.offset`);
 

@@ -152,6 +152,33 @@ import {libWrapper} from './shim.js';
 			UNCONSTRAINED: 1,
 		}
 
+		static isV14(){
+			return (game.release?.generation ?? 0) >= 14;
+		}
+
+		static v14MovementAction = "tokenAttacher";
+
+		static registerV14MovementAction(){
+			if(!TokenAttacher.isV14()) return;
+			const actions = CONFIG.Token?.movement?.actions;
+			if(!actions || Object.hasOwn(actions, TokenAttacher.v14MovementAction)) return;
+			const displace = actions.displace;
+			if(!displace) return;
+			actions[TokenAttacher.v14MovementAction] = {
+				...displace,
+				label: "Token Attacher",
+				order: (displace.order ?? 8) + 0.1,
+				getAnimationOptions: document => ({
+					duration: document.movement?.updateOptions?.animation?.duration ?? 0
+				})
+			};
+		}
+
+		static normalizeDocumentType(type){
+			if(TokenAttacher.isV14() && type === "MeasuredTemplate") return "Region";
+			return type;
+		}
+
 		static initMacroAPI(){
 			if(foundry.utils.getProperty(window,'tokenAttacher.attachElementToToken')) return;
 			window.tokenAttacher = {
@@ -203,9 +230,9 @@ import {libWrapper} from './shim.js';
 			Hooks.callAll(`${moduleName}.macroAPILoaded`);
 		}
 
-		static initialize(){
+		static async initialize(){
 			if(TokenAttacher.isFirstActiveGM()){
-				canvas.scene.unsetFlag(moduleName,"selected");
+				await canvas.scene.unsetFlag(moduleName,"selected");
 				console.log("Token Attacher| Initialized");
 			}
 
@@ -217,14 +244,131 @@ import {libWrapper} from './shim.js';
 			};
 			
 			TokenAttacher.initMacroAPI();
+			await TokenAttacher.migrateV14SceneAttachments();
 
 			TokenAttacher.updatedLockedAttached();
 
 		}
 
+		/**
+		 * V14 Regions can be attached to Tokens natively. Keep Token Attacher's
+		 * existing flags as the portable prefab format and mirror live links into
+		 * the core attachment field so every V14 Region shape follows the Token.
+		 */
+		static async migrateV14SceneAttachments(){
+			if(!TokenAttacher.isV14() || !TokenAttacher.isFirstActiveGM() || !canvas.scene) return;
+
+			const scene = canvas.scene;
+			const regionParents = new Map();
+			for(const region of scene.regions ?? []){
+				const parentId = region.getFlag(moduleName, "parent");
+				if(parentId && scene.tokens.get(parentId)) regionParents.set(region.id, parentId);
+			}
+
+			for(const token of scene.tokens ?? []){
+				const attached = foundry.utils.duplicate(token.getFlag(moduleName, "attached") || {});
+				const hadLegacyTemplates = Object.hasOwn(attached, "MeasuredTemplate");
+				const regionIds = new Set(attached.Region || []);
+				for(const id of attached.MeasuredTemplate || []){
+					if(scene.regions.get(id)) regionIds.add(id);
+				}
+				for(const [regionId, parentId] of regionParents){
+					if(parentId === token.id) regionIds.add(regionId);
+				}
+
+				const validRegionIds = [...regionIds].filter(id => scene.regions.get(id));
+				for(const regionId of validRegionIds){
+					if(!regionParents.has(regionId)) regionParents.set(regionId, token.id);
+				}
+
+				delete attached.MeasuredTemplate;
+				if(validRegionIds.length) attached.Region = validRegionIds;
+				else delete attached.Region;
+
+				const currentRegionIds = token.getFlag(moduleName, "attached.Region") || [];
+				const regionsChanged = (currentRegionIds.length !== validRegionIds.length)
+					|| currentRegionIds.some((id, index) => id !== validRegionIds[index]);
+				if(hadLegacyTemplates || regionsChanged){
+					await scene.updateEmbeddedDocuments("Token", [{
+						_id: token.id,
+						[`flags.${moduleName}.attached`]: attached
+					}], {[moduleName]: {update: true}});
+				}
+			}
+
+			const regionUpdates = [];
+			for(const [regionId, parentId] of regionParents){
+				const region = scene.regions.get(regionId);
+				if(!region) continue;
+				const nativeParentId = region._source?.attachment?.token ?? null;
+				const flagParentId = region.getFlag(moduleName, "parent") ?? null;
+				const update = {_id: regionId};
+				if(nativeParentId !== parentId) update["attachment.token"] = parentId;
+				if(flagParentId !== parentId) update[`flags.${moduleName}.parent`] = parentId;
+				const offset = region.getFlag(moduleName, "offset");
+				if(!offset?.shapes?.length){
+					const parent = scene.tokens.get(parentId);
+					if(parent){
+						update[`flags.${moduleName}.offset`] = TokenAttacher.getElementOffset(
+							"Region", region.toObject(), "Token", parent, {}
+						);
+					}
+				}
+				if(Object.keys(update).length > 1) regionUpdates.push(update);
+			}
+			if(regionUpdates.length){
+				await scene.updateEmbeddedDocuments("Region", regionUpdates, {[moduleName]: {update: true}});
+			}
+		}
+
+		/**
+		 * V14 interprets plain Token x/y updates as normal movement, including the
+		 * child Actor's movement action and speed. Use an animatable, forced
+		 * movement action so attached Tokens remain visually locked to the parent.
+		 */
+		static async updateEmbeddedDocuments(type, updates, options={}){
+			type = TokenAttacher.normalizeDocumentType(type);
+			updates = (updates || []).filter(update => update?._id);
+			if(!updates.length) return [];
+
+			if(TokenAttacher.isV14() && (type === "Token") && (canvas.scene?.moveTokens instanceof Function)){
+				const movementFields = ["x", "y", "elevation", "width", "height", "depth", "shape", "level"];
+				const moving = updates.filter(update => movementFields.some(field => Object.hasOwn(update, field)));
+				const stationary = updates.filter(update => !movementFields.some(field => Object.hasOwn(update, field)));
+
+				if(stationary.length) await canvas.scene.updateEmbeddedDocuments(type, stationary, options);
+				if(moving.length){
+					const instructions = {};
+					const action = Object.hasOwn(CONFIG.Token.movement.actions, TokenAttacher.v14MovementAction)
+						? TokenAttacher.v14MovementAction
+						: "displace";
+					for(const update of moving){
+						const {_id, ...destination} = update;
+						instructions[_id] = {
+							destination: {...destination, action},
+							autoRotate: false,
+							showRuler: false,
+							constrainOptions: {ignoreWalls: true, ignoreCost: true}
+						};
+					}
+					await canvas.scene.moveTokens(instructions, {
+						...options,
+						autoRotate: false,
+						showRuler: false,
+						constrainOptions: {...options.constrainOptions, ignoreWalls: true, ignoreCost: true}
+					});
+				}
+				return updates.map(update => canvas.scene.tokens.get(update._id)).filter(Boolean);
+			}
+
+			return canvas.scene.updateEmbeddedDocuments(type, updates, options);
+		}
+
 		static registeredLayers = [];
 
 		static _registerLayerByDocumentName(type){
+			type = TokenAttacher.normalizeDocumentType(type);
+			if(TokenAttacher.registeredLayers.includes(type)) return;
 			TokenAttacher.registeredLayers.push(type);
 			//Attached elements are not allowed to be moved by anything other then Token Attacher
 			Hooks.on(`update${type}`, (document, change, options, userId) => TokenAttacher.updateOffset(type, document, change, options, userId));
@@ -244,6 +388,7 @@ import {libWrapper} from './shim.js';
 
 		static registerHooks(){
 			Hooks.on('init', () => {
+				TokenAttacher.registerV14MovementAction();
 				TokenAttacher.registerSettings();
 			});
 
@@ -261,17 +406,41 @@ import {libWrapper} from './shim.js';
 			});
 			
 			Hooks.on('canvasReady', () => {
-				libWrapper.register(moduleName, 'canvas.mouseInteractionManager.callbacks.dragLeftDrop', function (wrapped, ...args) {
-					let result = wrapped(...args);
-
+				const callbacks = canvas.mouseInteractionManager?.callbacks;
+				const original = callbacks?.dragLeftDrop;
+				if(!original || original._tokenAttacherWrapped) return;
+				const wrapped = function(...args){
+					const result = original.apply(this, args);
 					TokenAttacher._RectangleSelection(...args);
 					return result;
-				}, 'WRAPPER');
+				};
+				wrapped._tokenAttacherWrapped = true;
+				callbacks.dragLeftDrop = wrapped;
 			});
 
+			Hooks.on("preUpdateToken", (document, change, options) => {
+				if(TokenAttacher.isV14()) return;
+				const attached = document.getFlag(moduleName, "attached") || {};
+				if(!Object.values(attached).some(ids => ids?.length)) return;
+				if(options._movement?.[document.id]?.autoRotate) delete change.rotation;
+			});
 			Hooks.on("preUpdateToken", (document, change, options, userId) => TokenAttacher.UpdateBasePosition("Token", document, change, options, userId));
 			Hooks.on("updateToken", (document, change, options, userId) => TokenAttacher.UpdateAttachedOfToken("Token", document, change, options, userId));
+			Hooks.on("preMoveToken", (document, movement) => {
+				if(!TokenAttacher.isV14()) return;
+				const attached = document.getFlag(moduleName, "attached") || {};
+				if(Object.values(attached).some(ids => ids?.length)) movement.autoRotate = false;
+			});
 			Hooks.on("updateActor", (document, change, options, userId) => TokenAttacher.updateAttachedPrototype(document, change, options, userId));
+			Hooks.on("createActor", (document, options, userId) => {
+				if(!canvas.ready) return;
+				return TokenAttacher.updateAttachedPrototype(
+					document,
+					{prototypeToken: document.prototypeToken.toObject()},
+					options,
+					userId
+				);
+			});
 			Hooks.on("preCreateToken", (document, data, options, userId) => TokenAttacher.preCreateBase(document, data, options, userId));
 			Hooks.on("createToken", (document, options, userId) => TokenAttacher.updateAttachedCreatedToken("Token", document, options, userId));
 			Hooks.on("pasteToken", (copy, toCreate) => TokenAttacher.pasteTokens(copy, toCreate));
@@ -279,7 +448,9 @@ import {libWrapper} from './shim.js';
 			Hooks.on("canvasInit", (canvasObj) => TokenAttacher.canvasInit(canvasObj));
 			Hooks.on("createPlaceableObjects", (parent, createdObjs, options, userId) => TokenAttacher.batchPostProcess(parent, createdObjs, options, userId));
 
-			for (const type of ["AmbientLight", "AmbientSound", "Drawing", "MeasuredTemplate", "Note", "Tile", "Token", "Wall"]) {
+			const coreLayers = ["AmbientLight", "AmbientSound", "Drawing", "Note", "Tile", "Token", "Wall"];
+			if(!TokenAttacher.isV14()) coreLayers.push("MeasuredTemplate");
+			for (const type of coreLayers) {
 				TokenAttacher._registerLayerByDocumentName(type);
 			}
 			
@@ -393,14 +564,14 @@ import {libWrapper} from './shim.js';
 			}	
 		}
 
-		static migrateAllPrototypeActors(){
+		static async migrateAllPrototypeActors(){
 			const folders = {};
 			const allActors = [...game.actors].filter(actor =>{
 				const attached = foundry.utils.getProperty(actor, `prototypeToken.flags.${moduleName}.prototypeAttached`) || {};
 				if(Object.keys(attached).length > 0) return true;
 				return false;
 			});
-			const allMappedActors = allActors.map(async (actor) => {return await TokenAttacher.migrateActor(actor)});
+			await Promise.all(allActors.map(actor => TokenAttacher.migrateActor(actor)));
 			
 			console.log("Token Attacher | " + game.i18n.format(localizedStrings.info.MigratedActors) );
 			ui.notifications.info(game.i18n.format(localizedStrings.info.MigratedActors));
@@ -414,9 +585,10 @@ import {libWrapper} from './shim.js';
 		}
 
 		static isPrototypeAttachedModel(prototypeAttached, model){
+			if(!prototypeAttached || !Object.keys(prototypeAttached).length) return false;
 			switch(model){
 				case 2:
-					return prototypeAttached[Object.keys(prototypeAttached)[0]].hasOwnProperty("objs");
+					return Object.hasOwn(prototypeAttached[Object.keys(prototypeAttached)[0]] ?? {}, "objs");
 			}
 			return false;
 		}
@@ -426,8 +598,8 @@ import {libWrapper} from './shim.js';
 			//Migrate to offset
 			if(parent_data){
 				const offset = foundry.utils.getProperty(objData, `flags.${moduleName}.offset`);
+				let parent_pos = foundry.utils.duplicate(foundry.utils.getProperty(parent_data, `flags.${moduleName}.pos`));
 				if(!offset){
-					let parent_pos = foundry.utils.duplicate(foundry.utils.getProperty(parent_data, `flags.${moduleName}.pos`));
 					foundry.utils.setProperty(objData, `flags.${moduleName}.parent`, parent_pos.base_id);
 					foundry.utils.setProperty(objData, `flags.${moduleName}.offset`, TokenAttacher.getElementOffset(type, objData, parent_type, foundry.utils.mergeObject(foundry.utils.mergeObject(parent_pos, parent_data), parent_pos.xy), {}));
 				}
@@ -482,7 +654,7 @@ import {libWrapper} from './shim.js';
 					if(prototypeAttached){
 						if(TokenAttacher.isPrototypeAttachedModel(prototypeAttached, 2)){
 							const update = await TokenAttacher.migrateActor(entity, true);
-							await pack.updateEntity({_id: index._id, prototypeToken: update});
+							await entity.update({prototypeToken: update});
 						}
 					}
 				}
@@ -502,7 +674,7 @@ import {libWrapper} from './shim.js';
 						if (attached.hasOwnProperty(key) && key !== "unknown") {
 							for (const elementid of attached[key]) {
 								let element = TokenAttacher.layerGetElement(key, elementid);
-								TokenAttacher.lockElement(key, element, false);
+								if(element) TokenAttacher.lockElement(key, element, false);
 							}
 						}
 					}
@@ -537,6 +709,8 @@ import {libWrapper} from './shim.js';
 				||	change.hasOwnProperty("direction")
 				||	change.hasOwnProperty("width")
 				||	change.hasOwnProperty("height")
+				||	change.hasOwnProperty("shape")
+				||	change.hasOwnProperty("level")
 				||	change.hasOwnProperty("radius")
 				||	change.hasOwnProperty("dim")
 				||	change.hasOwnProperty("bright")
@@ -562,8 +736,7 @@ import {libWrapper} from './shim.js';
 		static async UpdateAttachedOfToken(type, document, change, options, userId){
 			if(!foundry.utils.getProperty(options, `${moduleName}.attachmentsNeedUpdate`)) return;
 
-			let base = TokenAttacher.layerGetElement(type, document._id);
-			const attached=base.document.getFlag(moduleName, "attached") || {};
+			const attached=document.getFlag(moduleName, "attached") || {};
 			if(Object.keys(attached).length == 0) return true;
 
 			if(game.userId === userId && game.user.isGM){
@@ -578,26 +751,43 @@ import {libWrapper} from './shim.js';
 			}
 			if(!TokenAttacher.isFirstActiveGM()) return;
 			if(foundry.utils.getProperty(options, `${moduleName}.QuickEdit`)) return;
-			const tokenCenter = foundry.utils.duplicate(base.center);
-			if(Object.keys(attached).length == 0) return true;
 			if(foundry.utils.getProperty(options, `${moduleName}.update`)) return true;
 
 			TokenAttacher.detectGM();
 
-			const eventdata = [type, foundry.utils.mergeObject(foundry.utils.duplicate(base.document), change)];
+			const duration = document.movement?.animation?.duration;
+			const updateOptions = Number.isFinite(duration) ? {animation: {duration}} : {};
+			const resizeFields = ["width", "height", "depth", "shape"];
+			const movement = document.movement;
+			const resizeRegions = movement?.id
+				? resizeFields.some(field => movement.origin?.[field] !== movement.destination?.[field])
+				: resizeFields.some(field => Object.hasOwn(change, field));
+			const baseData = foundry.utils.mergeObject(document.toObject(), change, {inplace: false});
+			const eventdata = [type, baseData, false, updateOptions, resizeRegions];
 			if(TokenAttacher.isFirstActiveGM()) return TokenAttacher._UpdateAttachedOfBase(...eventdata);
-			else return game.socket.emit(`module.${moduleName}`, {event: `_UpdateAttachedOfBase`, eventdata: eventdata});
+			else return game.socket.emit(`module.${moduleName}`, {event: `UpdateAttachedOfBase`, eventdata: eventdata});
 		}
 
-		static async _UpdateAttachedOfBase(type, baseData, return_data=false){
+		static async _UpdateAttachedOfBase(type, baseData, return_data=false, updateOptions={}, resizeRegions=false){
 			const attached=foundry.utils.getProperty(baseData, `flags.${moduleName}.attached`) || {};
 			let attachedEntities = {};
 			
 			//Get Entities
 			for (const key in attached) {
-				attachedEntities[key] = attached[key].map(id => TokenAttacher.layerGetElement(key, id));
+				const documentType = TokenAttacher.normalizeDocumentType(key);
+				attachedEntities[documentType] ??= [];
+				attachedEntities[documentType].push(...attached[key].map(id => TokenAttacher.getElementDocument(documentType, id)));
 				//Filter null entities incase an invalid id was looked up
-				attachedEntities[key] = attachedEntities[key].filter(entity => entity != null);
+				attachedEntities[documentType] = attachedEntities[documentType].filter(entity => entity != null);
+			}
+
+			//V14 moves attached Regions itself, including every Region shape type.
+			if(TokenAttacher.isV14() && !resizeRegions && attachedEntities.Region){
+				attachedEntities.Region = attachedEntities.Region.filter(region => {
+					const parentId = region._source?.attachment?.token ?? region.attachment?.token?.id;
+					return parentId !== baseData._id;
+				});
+				if(!attachedEntities.Region.length) delete attachedEntities.Region;
 			}
 
 			let updates = {};
@@ -606,7 +796,7 @@ import {libWrapper} from './shim.js';
 			for (const key in attachedEntities) {
 				if (attachedEntities.hasOwnProperty(key)) {
 					if(!updates.hasOwnProperty(key)) updates[key] = [];
-					updates[key] = await TokenAttacher.offsetPositionOfElements(key, attachedEntities[key].map(entity => foundry.utils.duplicate(entity.document)), type, baseData, {});
+					updates[key] = await TokenAttacher.offsetPositionOfElements(key, attachedEntities[key].map(entity => foundry.utils.duplicate(entity)), type, baseData, {});
 					if(!updates[key]) delete updates[key];
 				}
 			}
@@ -615,13 +805,13 @@ import {libWrapper} from './shim.js';
 				if (attachedEntities.hasOwnProperty(key)) {
 					for (let i = 0; i < attachedEntities[key].length; i++) {
 						const element = attachedEntities[key][i];
-						const elem_id = element.document._id;
+						const elem_id = element._id;
 						
-						const elem_attached=foundry.utils.getProperty(element.document, `flags.${moduleName}.attached`) || {};
+						const elem_attached=foundry.utils.getProperty(element, `flags.${moduleName}.attached`) || {};
 						if(Object.keys(elem_attached).length > 0){
 							const elem_update = updates[key].find(item => item._id === elem_id );
-							const updatedElementData = foundry.utils.mergeObject(foundry.utils.duplicate(element.document), elem_update);
-							const subUpdates = await TokenAttacher._UpdateAttachedOfBase(key, updatedElementData, true);
+							const updatedElementData = foundry.utils.mergeObject(foundry.utils.duplicate(element), elem_update);
+							const subUpdates = await TokenAttacher._UpdateAttachedOfBase(key, updatedElementData, true, updateOptions, resizeRegions);
 							for (const key in subUpdates) {
 								if (subUpdates.hasOwnProperty(key)) {
 									updates[key] = subUpdates[key].concat(updates[key] ?? []);	
@@ -645,10 +835,13 @@ import {libWrapper} from './shim.js';
 			}
 			if(return_data) return updates;
 			
-			//Fire all updates by type
-			for (const key in updates) {
-				await canvas.scene.updateEmbeddedDocuments(key, updates[key], {[moduleName]:{update:true}});
-			}
+			//Fire all updates together so every attachment starts with the parent.
+			await Promise.all(Object.entries(updates).map(([key, typeUpdates]) =>
+				TokenAttacher.updateEmbeddedDocuments(key, typeUpdates, {
+					...updateOptions,
+					[moduleName]: {update: true}
+				})
+			));
 
 			return;
 		}
@@ -704,7 +897,7 @@ import {libWrapper} from './shim.js';
 			baseOffset.center = TokenAttacher.getCenter(baseType, baseData, grid);
 			baseOffset.rotation = foundry.utils.getProperty(baseData, "rotation") ?? foundry.utils.getProperty(baseData, "direction");
 			baseOffset.size = TokenAttacher.getSize(baseData);
-			baseOffset.elevation = baseData.elevation ?? baseData.flags?.levels?.elevation ?? baseData.flags?.levels?.rangeBottom ?? baseData.flags?.wallHeight?.wallHeightBottom ?? baseData.flags?.['wall-height']?.bottom;
+			baseOffset.elevation = baseData.elevation?.bottom ?? baseData.elevation ?? baseData.flags?.levels?.elevation ?? baseData.flags?.levels?.rangeBottom ?? baseData.flags?.wallHeight?.wallHeightBottom ?? baseData.flags?.['wall-height']?.bottom ?? 0;
 			
 			if(!Array.isArray(objData)) objData = [objData];
 
@@ -732,12 +925,15 @@ import {libWrapper} from './shim.js';
 			}
 
 			//Elevation
-			if(offset.elevation?.hasOwnProperty('elevation')){
+			if(typeof offset.elevation?.elevation === "number"){
 				update.elevation = baseOffset.elevation + offset.elevation.elevation;
 			}
 
 			//Line Entities
-			if('c' in objData){
+			if(type === "Region"){
+				// Region geometry is handled by the core compatibility hook below.
+			}
+			else if('c' in objData){
 				let c = foundry.utils.duplicate(objData.c);	
 				[offset.x, offset.y] = [offset.c[0], offset.c[1]];
 				[c[0],c[1]]  = TokenAttacher.moveRotatePoint(offset, baseOffset.center, baseOffset.rotation, size_multi);
@@ -753,7 +949,7 @@ import {libWrapper} from './shim.js';
 					|| 'dim' in objData 
 					|| (objData.hasOwnProperty('config') && 'dim' in objData.config) 
 					|| 'radius' in objData){
-				const [x,y,rotation] =TokenAttacher.moveRotateRectangle(objData, offset, baseOffset.center, baseOffset.rotation, size_multi);
+				const [x,y,rotation] =TokenAttacher.moveRotateRectangle(type, objData, offset, baseOffset.center, baseOffset.rotation, size_multi);
 				update.x = x;
 				update.y = y;
 				if(objData.hasOwnProperty("direction")) update.direction = rotation;
@@ -808,6 +1004,13 @@ import {libWrapper} from './shim.js';
 				update.x = x;
 				update.y = y;
 			}
+			if(TokenAttacher.isV14() && (type === "Token") && (baseType === "Token") && baseData.level){
+				update.level = baseData.level;
+			}
+			else if(TokenAttacher.isV14() && Array.isArray(objData.levels) && baseData.level){
+				update.levels = [baseData.level];
+			}
+			if(Object.hasOwn(baseData, "hidden") && Object.hasOwn(objData, "hidden")) update.hidden = baseData.hidden;
 			//Other Modules
 			Hooks.callAll(`${moduleName}.offsetPositionOfElement`, type, objData, baseType, baseData, baseOffset, grid_multi, update);
 
@@ -825,7 +1028,7 @@ import {libWrapper} from './shim.js';
 		 * Moves a rectangle by offset values and rotates around an anchor
 		 * A rectangle is defined by having a center, _id, x, y and rotation or direction
 		 */
-		static moveRotateRectangle(rect, offset, anchorCenter, anchorRot, size_multi){
+		static moveRotateRectangle(type, rect, offset, anchorCenter, anchorRot, size_multi){
 			let x =anchorCenter.x + offset.x;
 			let	y =anchorCenter.y + offset.y; 
 			let newRot = (anchorRot + offset.offRot) % 360;
@@ -837,8 +1040,19 @@ import {libWrapper} from './shim.js';
 				rectCenter.x = anchorCenter.x + offset.centerX;
 				rectCenter.y = anchorCenter.y + offset.centerY;
 				[rectCenter.x,rectCenter.y] = TokenAttacher.computeRotatedPosition(anchorCenter.x, anchorCenter.y, rectCenter.x, rectCenter.y, deltaRotRad, size_multi);
-				x = rectCenter.x - (offset.centerX - offset.x) * size_multi.w;
-				y = rectCenter.y - (offset.centerY - offset.y) * size_multi.h;
+				if(TokenAttacher.isV14() && (type === "Tile") && (rect.texture?.anchorX !== undefined) && (rect.texture?.anchorY !== undefined)){
+					const width = (offset.size.width ?? rect.width) * size_multi.w;
+					const height = (offset.size.height ?? rect.height) * size_multi.h;
+					const a = Math.toRadians(newRot);
+					const dx = (0.5 - rect.texture.anchorX) * width;
+					const dy = (0.5 - rect.texture.anchorY) * height;
+					x = rectCenter.x - ((Math.cos(a) * dx) - (Math.sin(a) * dy));
+					y = rectCenter.y - ((Math.sin(a) * dx) + (Math.cos(a) * dy));
+				}
+				else{
+					x = rectCenter.x - (offset.centerX - offset.x) * size_multi.w;
+					y = rectCenter.y - (offset.centerY - offset.y) * size_multi.h;
+				}
 			//}
 			return [x, y, newRot];
 		}
@@ -951,17 +1165,20 @@ import {libWrapper} from './shim.js';
 		 * Attach elements to token
 		 */
 		static async _AttachToToken(token, elements, suppressNotification=false, return_data=false){
-			if(typeof token === 'string' || token instanceof String) token = canvas.tokens.get(token);
-			if(!token) return ui.notifications.error(game.i18n.format(localizedStrings.error.NoTokensSelected));
+			if(typeof token === 'string' || token instanceof String) token = canvas.scene.tokens.get(token);
+			const tokenDocument = token?.document ?? token;
+			if(!tokenDocument) return ui.notifications.error(game.i18n.format(localizedStrings.error.NoTokensSelected));
 			if(!elements.hasOwnProperty("type")) return;
+			elements = {...elements, type: TokenAttacher.normalizeDocumentType(elements.type)};
+			const baseType = token.layer?.constructor.documentName ?? tokenDocument.documentName;
 			
 			let updates = {};
-			let attached=foundry.utils.duplicate(token.document.getFlag(moduleName, `attached.${elements.type}`) || []);
+			let attached=foundry.utils.duplicate(tokenDocument.getFlag(moduleName, `attached.${elements.type}`) || []);
 			
 			attached = attached.concat(elements.ids.filter((item) => attached.indexOf(item) < 0))
 			//Filter non existing
-			attached = attached.filter((item) => TokenAttacher.layerGetElement(elements.type, item));
-			let all_attached=foundry.utils.duplicate(token.document.getFlag(moduleName, `attached`) || {});
+			attached = attached.filter((item) => TokenAttacher.getElementDocument(elements.type, item));
+			let all_attached=foundry.utils.duplicate(tokenDocument.getFlag(moduleName, `attached`) || {});
 			all_attached[elements.type] = attached;
 			const dup = TokenAttacher.areDuplicatesInAttachChain(token, all_attached);
 			if(dup !== false){
@@ -969,30 +1186,27 @@ import {libWrapper} from './shim.js';
 				return ui.notifications.error(game.i18n.format(localizedStrings.error.ElementAlreadyAttachedInChain));
 			}
 
-			let token_update = await TokenAttacher.saveBasePositon(token.layer.constructor.documentName, token, true);
+			let token_update = await TokenAttacher.saveBasePositon(baseType, tokenDocument, true);
 			token_update[`flags.${moduleName}.attached.${elements.type}`] = attached;
-			updates[token.layer.constructor.documentName] = [token_update];
+			updates[baseType] = [token_update];
 
-			const xy = {x:token.x, y:token.y};
-			const center = {x:token.center.x, y:token.center.y};
-			const rotation = token.rotation;
-
-			const tokensize = TokenAttacher.getElementSize(token);
 			if(!updates.hasOwnProperty(elements.type)) updates[elements.type] = [];
 
 			for (let i = 0; i < attached.length; i++) {
-				const element = TokenAttacher.layerGetElement(elements.type, attached[i]);
-				updates[elements.type].push({_id:attached[i], 
-					[`flags.${moduleName}.parent`]: token.document._id, 
-					[`flags.${moduleName}.offset`]: TokenAttacher.getElementOffset(elements.type, element.document, token.layer.constructor.documentName, token.document, {})});
+				const element = TokenAttacher.getElementDocument(elements.type, attached[i]);
+				const update = {_id:attached[i],
+					[`flags.${moduleName}.parent`]: tokenDocument._id,
+					[`flags.${moduleName}.offset`]: TokenAttacher.getElementOffset(elements.type, element, baseType, tokenDocument, {})};
+				if(TokenAttacher.isV14() && (elements.type === "Region")) update["attachment.token"] = tokenDocument._id;
+				updates[elements.type].push(update);
 			}
 			if(return_data){
 				return updates;
 			}
-			if(token.layer.constructor.documentName !== elements.type) {
-				await canvas.scene.updateEmbeddedDocuments(token.layer.constructor.documentName, updates[token.layer.constructor.documentName]);
+			if(baseType !== elements.type) {
+				await TokenAttacher.updateEmbeddedDocuments(baseType, updates[baseType]);
 			}
-			await canvas.scene.updateEmbeddedDocuments(elements.type, updates[elements.type]);
+			await TokenAttacher.updateEmbeddedDocuments(elements.type, updates[elements.type]);
 
 			if(!suppressNotification) ui.notifications.info(game.i18n.format(localizedStrings.info.ObjectsAttached));
 			return; 
@@ -1011,6 +1225,7 @@ import {libWrapper} from './shim.js';
 		 */
 		static async _updateAttachedOffsets({type, element}){
 			const updateFunc = async (base) =>{
+				if(!base) return;
 				let attached=base.document.getFlag(moduleName, "attached") || {};
 				for (const key in attached) {
 					if (attached.hasOwnProperty(key) && key !== "unknown") {
@@ -1023,7 +1238,7 @@ import {libWrapper} from './shim.js';
 			if(Array.isArray(element)){
 				for (let i = 0; i < element.length; i++) {
 					const elem = TokenAttacher.layerGetElement(type, element[i]);
-					await updateFunc(elem);
+					if(elem) await updateFunc(elem);
 				}
 			}
 			else await updateFunc(element);
@@ -1034,41 +1249,48 @@ import {libWrapper} from './shim.js';
 		 */
 		static async _DetachFromToken(token, elements, suppressNotification=false, options={}){
 			if(!token) return ui.notifications.error(game.i18n.format(localizedStrings.error.NoTokensSelected));
-			if(typeof token === 'string' || token instanceof String) token = canvas.tokens.get(token);
-			if(!token) return;
+			if(typeof token === 'string' || token instanceof String) token = canvas.scene.tokens.get(token);
+			const tokenDocument = token?.document ?? token;
+			if(!tokenDocument) return;
 			if(!elements || !elements.hasOwnProperty("type")){
 				//Detach all
-				let attached=token.document.getFlag(moduleName, `attached`);
+				let attached=tokenDocument.getFlag(moduleName, `attached`) || {};
 				if(Object.keys(attached).length > 0){
 					for (const key in attached) {
 						if (attached.hasOwnProperty(key)) {
+							const documentType = TokenAttacher.normalizeDocumentType(key);
 							const arr = attached[key];
 							let deletes = [];
 							for (let i = 0; i < arr.length; i++) {
-								deletes.push({_id: arr[i], [`flags.-=${moduleName}`]: null});
+								const update = {_id: arr[i], [`flags.-=${moduleName}`]: null};
+								if(TokenAttacher.isV14() && (documentType === "Region")) update["attachment.token"] = null;
+								deletes.push(update);
 							}	
-							if(deletes.length > 0)	await canvas.scene.updateEmbeddedDocuments(key, deletes, {[moduleName]:{update:true}});						
+							if(deletes.length > 0)	await TokenAttacher.updateEmbeddedDocuments(documentType, deletes, {[moduleName]:{update:true}});
 						}
 					}
 				}
 
-				await token.document.unsetFlag(moduleName, "attached");
+				await tokenDocument.unsetFlag(moduleName, "attached");
 				if(!suppressNotification) ui.notifications.info(game.i18n.format(localizedStrings.info.ObjectsDetached));
 				return;
 			}
 			else{
 				//Detach all passed elements
-				let attached=token.document.getFlag(moduleName, `attached.${elements.type}`) || [];
+				elements = {...elements, type: TokenAttacher.normalizeDocumentType(elements.type)};
+				let attached=tokenDocument.getFlag(moduleName, `attached.${elements.type}`) || [];
 				if(attached.length === 0) return;
 
 				attached= attached.filter((item) => !elements.ids.includes(item));
 								
 				let deletes = [];
 				for (let i = 0; i < elements.ids.length; i++) {
-					deletes.push({_id: elements.ids[i], [`flags.-=${moduleName}`]: null});
+					const update = {_id: elements.ids[i], [`flags.-=${moduleName}`]: null};
+					if(TokenAttacher.isV14() && (elements.type === "Region")) update["attachment.token"] = null;
+					deletes.push(update);
 				}
-				if(deletes.length > 0 && !options.skip_update) await canvas.scene.updateEmbeddedDocuments(elements.type, deletes, {[moduleName]:{update:true}});	
-				await token.document.setFlag(moduleName, `attached.${elements.type}`, attached);
+				if(deletes.length > 0 && !options.skip_update) await TokenAttacher.updateEmbeddedDocuments(elements.type, deletes, {[moduleName]:{update:true}});
+				await tokenDocument.setFlag(moduleName, `attached.${elements.type}`, attached);
 				if(!suppressNotification) ui.notifications.info(game.i18n.format(localizedStrings.info.ObjectsDetached));
 			}
 		}
@@ -1078,22 +1300,28 @@ import {libWrapper} from './shim.js';
 		 */
 		static _getControlButtons(controls){
 			const tokens = controls.tokens;
+			if(!tokens) return;
+			const nextOrder = Math.max(0, ...Object.values(tokens.tools).map(tool => tool.order ?? 0)) + 1;
+			const startAttach = () => TokenAttacher._StartTokenAttach(canvas.tokens.controlled[0]);
+			const toggleQuickEdit = () => TokenAttacher.toggleQuickEditMode();
 			tokens.tools['TAStartTokenAttach'] = {
 				name: "TAStartTokenAttach",
 				title: game.i18n.format(localizedStrings.button.StartTokenAttach),
 				icon: "fas fa-link",
+				order: nextOrder,
 				visible: game.user.isGM,
-				onClick: () => TokenAttacher._StartTokenAttach(canvas.tokens.controlled[0]),
+				onChange: startAttach,
 				button: true
 				};
 			tokens.tools['TAToggleQuickEdit'] = {
 				name: "TAToggleQuickEdit",
 				title: game.i18n.format(localizedStrings.button.ToggleQuickEditMode),
 				icon: "fas fa-feather-alt",
+				order: nextOrder + 1,
 				visible: game.user.isGM,
-				onClick: () => TokenAttacher.toggleQuickEditMode(),
+				onChange: toggleQuickEdit,
 				toggle: true,
-				active: foundry.utils.getProperty(window, 'tokenAttacher.quickEdit') ?? false,
+				active: !!foundry.utils.getProperty(window, 'tokenAttacher.quickEdit'),
 			};
 			console.log("Token Attacher | Tools added.");
 		}
@@ -1149,7 +1377,7 @@ import {libWrapper} from './shim.js';
 
 			for (const key in updates) {
 				if (updates.hasOwnProperty(key)) {
-					await canvas.scene.updateEmbeddedDocuments(key, updates[key], {[moduleName]:{update:true}});	
+					await TokenAttacher.updateEmbeddedDocuments(key, updates[key], {[moduleName]:{update:true}});
 				}
 			}
 		}
@@ -1164,7 +1392,12 @@ import {libWrapper} from './shim.js';
 			await canvas.scene.setFlag(moduleName, "attach_base", {type:token.layer.constructor.documentName, element:token.document._id});
 			const locked_status = token.document.getFlag(moduleName, "locked") || false;
 			// Get the handlebars output
-			const myHtml = await foundry.applications.handlebars.renderTemplate(`${templatePath}/tokenAttacherUI.html`, {["token-image"]: token.document.texture.src, ["token-name"]: token.document.name});
+			const tokenImage = token.document.texture.src;
+			const myHtml = await foundry.applications.handlebars.renderTemplate(`${templatePath}/tokenAttacherUI.html`, {
+				["token-image"]: tokenImage,
+				["token-name"]: token.document.name,
+				["token-video"]: /\.(?:webm|mp4|m4v|ogv)(?:\?.*)?$/i.test(tokenImage)
+			});
 
 			window.document.getElementById("hud").insertAdjacentHTML('afterend', myHtml);
 
@@ -1300,7 +1533,7 @@ import {libWrapper} from './shim.js';
 			//Fire Updates
 			for (const key in updates) {
 				if (updates.hasOwnProperty(key)) {
-					if(updates[key].length > 0) await canvas.scene.updateEmbeddedDocuments(key, updates[key], {[moduleName]:{update:true}});	
+					if(updates[key].length > 0) await TokenAttacher.updateEmbeddedDocuments(key, updates[key], {[moduleName]:{update:true}});
 				}
 			}
 			if(!suppressNotification) {
@@ -1339,7 +1572,7 @@ import {libWrapper} from './shim.js';
 			//Fire Updates
 			for (const key in updates) {
 				if (updates.hasOwnProperty(key)) {
-					if(updates[key].length > 0) await canvas.scene.updateEmbeddedDocuments(key, updates[key], {[moduleName]:{update:true}});	
+					if(updates[key].length > 0) await TokenAttacher.updateEmbeddedDocuments(key, updates[key], {[moduleName]:{update:true}});
 				}
 			}
 			if(!suppressNotification) {
@@ -1381,10 +1614,11 @@ import {libWrapper} from './shim.js';
 			const isHighlighted = icons[0].classList.contains("hidden");
 
 			for (const key in attached) {
-				if (attached.hasOwnProperty(key) && key !== "unknown") {
-					for (const elementid of attached[key]) {
-						let element = TokenAttacher.layerGetElement(key, elementid);
-						if(!isHighlighted) element.alpha = 0.5;
+					if (attached.hasOwnProperty(key) && key !== "unknown") {
+						for (const elementid of attached[key]) {
+							let element = TokenAttacher.layerGetElement(key, elementid);
+							if(!element) continue;
+							if(!isHighlighted) element.alpha = 0.5;
 						else element.alpha = 1;
 					}
 				}
@@ -1401,14 +1635,12 @@ import {libWrapper} from './shim.js';
 
 		static async closeTokenAttacherUI(){
 			const attachment_base = canvas.scene.getFlag(moduleName, "attach_base");
-			let layer;
 			let base;	
 			if(attachment_base){
-				if(layer)
-					base = this.layerGetElement(attachment_base.type, attachment_base.element);
+				base = this.layerGetElement(attachment_base.type, attachment_base.element);
 			}		
 			if(base) TokenAttacher._updateAttachedOffsets(attachment_base);
-			window.document.getElementById("tokenAttacher").remove();
+			window.document.getElementById("tokenAttacher")?.remove();
 			return await canvas.scene.unsetFlag(moduleName, "attach_base");		
 		}
 
@@ -1535,7 +1767,7 @@ import {libWrapper} from './shim.js';
 			let  base_elevation = baseDoc.elevation?.bottom ?? baseDoc.elevation ?? baseDoc.flags['levels']?.elevation ?? baseDoc.flags['levels']?.rangeBottom ?? baseDoc.flags['wallHeight']?.wallHeightBottom ?? baseDoc.flags['wall-height']?.bottom ?? 0;
 			offset.elevation = {};
 			offset.elevation.flags = {};
-			if(objData.hasOwnProperty('elevation')){
+			if(typeof objData.elevation === "number"){
 				offset.elevation.elevation= objData.elevation;
 				if([null, Infinity, -Infinity].includes(offset.elevation.elevation) === false) offset.elevation.elevation -= base_elevation;
 			}
@@ -1581,11 +1813,94 @@ import {libWrapper} from './shim.js';
 			return size;
 		}
 
+		static migrateTileDataV14(tileData){
+			if(!TokenAttacher.isV14()) return tileData;
+			const tile = foundry.utils.duplicate(tileData);
+			if((tile.overhead === true) && !Number.isFinite(tile.elevation)){
+				tile.elevation = 4 * (canvas.scene?.grid?.distance ?? game.system.grid?.distance ?? 5);
+			}
+			if("roof" in tile){
+				tile.restrictions ??= {};
+				tile.restrictions.light = !!tile.roof;
+				tile.restrictions.weather = !!tile.roof;
+				delete tile.roof;
+			}
+			delete tile.overhead;
+			tile.texture = (tile.texture && (typeof tile.texture === "object")) ? tile.texture : {};
+			const legacyPosition = (tile.texture.anchorX === undefined) && (tile.texture.anchorY === undefined);
+			tile.texture.anchorX ??= 0.5;
+			tile.texture.anchorY ??= 0.5;
+			if(legacyPosition){
+				if(Number(tile.rotation ?? 0) === 0){
+					tile.texture.anchorX -= 0.5;
+					tile.texture.anchorY -= 0.5;
+				}
+				else{
+					tile.x = Math.round((tile.x ?? 0) + ((tile.width ?? 0) / 2));
+					tile.y = Math.round((tile.y ?? 0) + ((tile.height ?? 0) / 2));
+				}
+			}
+			return tile;
+		}
+
+		static preparePrototypeAttachedV14(prototypeAttached){
+			if(!TokenAttacher.isV14()) return foundry.utils.duplicate(prototypeAttached);
+			const prepared = {};
+			for(const [sourceType, sourceDocuments] of Object.entries(foundry.utils.duplicate(prototypeAttached) || {})){
+				if(!Array.isArray(sourceDocuments)) continue;
+				const documentType = TokenAttacher.normalizeDocumentType(sourceType);
+				prepared[documentType] ??= [];
+				for(let documentData of sourceDocuments){
+					if(sourceType === "MeasuredTemplate"){
+						try {
+							const legacyOffset = foundry.utils.duplicate(foundry.utils.getProperty(documentData, `flags.${moduleName}.offset`));
+							const templatePosition = {x: Number(documentData.x ?? 0), y: Number(documentData.y ?? 0)};
+							documentData = CONFIG.Region.documentClass._migrateMeasuredTemplateData(documentData, {
+								grid: canvas.grid,
+								gridTemplates: game.settings.get("core", "gridTemplates"),
+								coneTemplateType: game.settings.get("core", "coneTemplateType"),
+								users: game.users.map(user => user.toObject())
+							});
+							if(legacyOffset){
+								const baseCenter = {
+									x: templatePosition.x - Number(legacyOffset.x ?? 0),
+									y: templatePosition.y - Number(legacyOffset.y ?? 0)
+								};
+								const baseRotation = Number(legacyOffset.rot ?? documentData.shapes?.[0]?.rotation ?? 0)
+									- Number(legacyOffset.offRot ?? 0);
+								delete legacyOffset.shapes;
+								Hooks.callAll(`${moduleName}.getElementOffset`, "Region", documentData, "AmbientLight", {
+									...baseCenter,
+									rotation: baseRotation,
+									elevation: 0,
+									flags: {}
+								}, {}, legacyOffset);
+								for(const shapeOffset of legacyOffset.shapes || []) shapeOffset._taSkipGridScale = true;
+								foundry.utils.setProperty(documentData, `flags.${moduleName}.offset`, legacyOffset);
+							}
+						}
+						catch(error){
+							console.warn("Token Attacher | Could not migrate a legacy Measured Template prefab.", error);
+							continue;
+						}
+					}
+					if(documentType === "Tile") documentData = TokenAttacher.migrateTileDataV14(documentData);
+					prepared[documentType].push(documentData);
+				}
+			}
+			return prepared;
+		}
+
 		static getObjectsFromIds(base_type, base_data, type, idArray){
+			type = TokenAttacher.normalizeDocumentType(type);
 			let copyArray = [];
 			for (const elementid of idArray) {
-				const element = TokenAttacher.layerGetElement(type, elementid);
-				let dup_data = foundry.utils.duplicate(element.document);
+				const element = TokenAttacher.getElementDocument(type, elementid);
+				if(!element){
+					console.warn(`Token Attacher | Ignoring missing ${type} attachment ${elementid}.`);
+					continue;
+				}
+				let dup_data = element.toObject instanceof Function ? element.toObject() : foundry.utils.duplicate(element);
 				delete dup_data._id;
 				foundry.utils.setProperty(dup_data, `flags.${moduleName}.offset`, TokenAttacher.getElementOffset(type, dup_data, base_type, 
 					foundry.utils.mergeObject(
@@ -1594,8 +1909,8 @@ import {libWrapper} from './shim.js';
 							foundry.utils.getProperty(base_data, `flags.${moduleName}.pos.xy`)), 
 							foundry.utils.getProperty(base_data, `flags.${moduleName}.pos`)
 							), {}));
-				if(TokenAttacher.isAttachmentBase(element.document)){
-					const prototypeAttached = TokenAttacher.generatePrototypeAttached(element.document);
+				if(TokenAttacher.isAttachmentBase(element)){
+					const prototypeAttached = TokenAttacher.generatePrototypeAttached(element);
 					delete dup_data.flags[moduleName].attached;
 					dup_data.flags[moduleName].prototypeAttached = prototypeAttached;
 				}
@@ -1647,20 +1962,26 @@ import {libWrapper} from './shim.js';
 			if(!TokenAttacher.isFirstActiveGM()) return;
 			if(!change.prototypeToken?.flags?.[moduleName]) return;
 
-			if(!TokenAttacher.isAttachmentBase(change.prototypeToken)) return;
+			const prototypeToken = foundry.utils.mergeObject(
+				document.prototypeToken.toObject(),
+				change.prototypeToken,
+				{inplace: false}
+			);
+			if(!TokenAttacher.isAttachmentBase(prototypeToken)) return;
 
 			if(TokenAttacher.isAttachmentUIOpen()){			
 				console.log("Token Attacher | " + 	game.i18n.format(localizedStrings.error.UIisOpenOnAssign));			
 				ui.notifications.error(game.i18n.format(localizedStrings.error.UIisOpenOnAssign));
 			}
 
-			let prototypeAttached = TokenAttacher.generatePrototypeAttached(change.prototypeToken);
-			let newToken = foundry.utils.duplicate(change.prototypeToken);
-			//delete newToken.flags[`${moduleName}`].attached;			
-			delete newToken.flags[`${moduleName}`].prototypeAttached;
-			newToken[`flags.${moduleName}.-=attached`] = null;
-			newToken[`flags.${moduleName}.prototypeAttached`] = prototypeAttached;
-			newToken[`flags.${moduleName}.grid`] = TokenAttacher.getCurrentGrid();
+			let prototypeAttached = TokenAttacher.generatePrototypeAttached(prototypeToken);
+			let newToken = foundry.utils.duplicate(prototypeToken);
+			foundry.utils.unsetProperty(newToken, `flags.${moduleName}.attached`);
+			newToken.flags ??= {};
+			newToken.flags[moduleName] ??= {};
+			newToken.flags[moduleName]["-=attached"] = null;
+			foundry.utils.setProperty(newToken, `flags.${moduleName}.prototypeAttached`, prototypeAttached);
+			foundry.utils.setProperty(newToken, `flags.${moduleName}.grid`, TokenAttacher.getCurrentGrid());
 			await document.update({prototypeToken: newToken}, {diff:false});
 		}
 
@@ -1670,7 +1991,9 @@ import {libWrapper} from './shim.js';
 
 			for (const key in attached) {
 				if (attached.hasOwnProperty(key)) {
-					prototypeAttached[key] = TokenAttacher.getObjectsFromIds("Token", token_data, key, attached[key]);
+					const documentType = TokenAttacher.normalizeDocumentType(key);
+					prototypeAttached[documentType] ??= [];
+					prototypeAttached[documentType].push(...TokenAttacher.getObjectsFromIds("Token", token_data, documentType, attached[key]));
 				}
 			}	
 			return prototypeAttached;
@@ -1731,12 +2054,22 @@ import {libWrapper} from './shim.js';
 			TokenAttacher.detectGM();
 			//Combine with eventual bases
 			let deletes = TokenAttacher.getChildrenIds(attached, {});
+			if(TokenAttacher.isV14() && deletes.Region){
+				const deletingTokenIds = new Set([document._id, ...(deletes.Token || [])]);
+				deletes.Region = deletes.Region.filter(id => {
+					const region = canvas.scene.getEmbeddedDocument("Region", id);
+					const parentId = region?._source?.attachment?.token ?? region?.attachment?.token?.id;
+					return !deletingTokenIds.has(parentId);
+				});
+				if(!deletes.Region.length) delete deletes.Region;
+			}
 
 			//Fire deletes
 			for (const key in deletes) {
 				if (deletes.hasOwnProperty(key)) {
-					let layer = TokenAttacher.getLayerOrCollection(key);
-					await canvas.scene.deleteEmbeddedDocuments(layer.constructor.documentName, deletes[key], {[moduleName]:{update:true}});
+					const documentType = TokenAttacher.normalizeDocumentType(key);
+					const ids = deletes[key].filter(id => canvas.scene.getEmbeddedDocument(documentType, id));
+					if(ids.length) await canvas.scene.deleteEmbeddedDocuments(documentType, ids, {[moduleName]:{update:true}});
 				}
 			}
 		}
@@ -1749,11 +2082,11 @@ import {libWrapper} from './shim.js';
 					for (let i = 0; i < attached[key].length; i++) {
 						const id = attached[key][i];		
 
-						let element = TokenAttacher.layerGetElement(key, id);
+						let element = TokenAttacher.getElementDocument(key, id);
 						if(!element) continue;		
 
 						all_ids[key].push(id);
-						const child_attached=foundry.utils.getProperty(element.document, `flags.${moduleName}.attached`) || {};
+						const child_attached=foundry.utils.getProperty(element, `flags.${moduleName}.attached`) || {};
 
 						if(Object.keys(child_attached).length > 0) {
 							const child_ids = TokenAttacher.getChildrenIds(child_attached, all_ids);
@@ -1791,18 +2124,18 @@ import {libWrapper} from './shim.js';
 			if(game.users.find(u => u._id ==userId)?.viewedScene != game.user.viewedScene) return;
 			
 			if(!TokenAttacher.isFirstActiveGM()) return;
-			const token = canvas.tokens.get(document._id);
-			if(!token) return;
+			const tokenObject = document.object ?? canvas.tokens.get(document._id);
+			const token = tokenObject ?? document;
 			//Checks for multilevel tokens and v&m
-			if(foundry.utils.getProperty(game, 'multilevel')) {
-				if(game.multilevel._isReplicatedToken(token)) token.document.unsetFlag(moduleName, 'attached');
+			if(tokenObject && foundry.utils.getProperty(game, 'multilevel')) {
+				if(game.multilevel._isReplicatedToken(tokenObject)) document.unsetFlag(moduleName, 'attached');
 			}
 			if(foundry.utils.getProperty(options, "isUndo") === true && foundry.utils.getProperty(options, "mlt_bypass") === true) return;
 
 			if(foundry.utils.getProperty(options, `${moduleName}.update`)) return;
 			
-			const prototypeAttached = token.document.getFlag(moduleName, "prototypeAttached") || {};
-			const attached = token.document.getFlag(moduleName, "attached") || {};
+			const prototypeAttached = document.getFlag(moduleName, "prototypeAttached") || {};
+			const attached = document.getFlag(moduleName, "attached") || {};
 			
 			if(foundry.utils.getProperty(options, "isUndo") === true){
 				if(Object.keys(attached).length > 0){
@@ -1814,7 +2147,7 @@ import {libWrapper} from './shim.js';
 			if(Object.keys(prototypeAttached).length > 0){
 				if(TokenAttacher.isPrototypeAttachedModel(prototypeAttached, 2)) return ui.notifications.error(game.i18n.format(localizedStrings.error.ActorDataModelNeedsMigration));
 				
-				let grid_multi = token.document.getFlag(moduleName, "grid") || TokenAttacher.getCurrentGrid();
+				let grid_multi = document.getFlag(moduleName, "grid") || TokenAttacher.getCurrentGrid();
 				//Convert pre V12
 				grid_multi.sizeX = grid_multi.w ?? grid_multi.sizeX; 
 				grid_multi.sizeY = grid_multi.h ?? grid_multi.sizeY; 
@@ -1830,13 +2163,14 @@ import {libWrapper} from './shim.js';
 		}
 
 		static async regenerateAttachedFromPrototype(baseType, base, prototypeAttached, grid_multi, options={},  return_data = false){
+			options = {...options, [moduleName]: {...options[moduleName]}};
 			grid_multi = foundry.utils.mergeObject({size:1, sizeX: 1, sizeY:1}, grid_multi);
 			const grid = this.getCurrentGrid();
 			let pasted = {};
 			let toCreate = {};
 			const baseDocument = base.document ?? base;
 			
-			prototypeAttached = foundry.utils.duplicate(prototypeAttached);
+			prototypeAttached = TokenAttacher.preparePrototypeAttachedV14(prototypeAttached);
 
 			for (const key in prototypeAttached) {
 				if (prototypeAttached.hasOwnProperty(key) && key !== "unknown" && prototypeAttached[key].length > 0) {
@@ -1847,6 +2181,11 @@ import {libWrapper} from './shim.js';
 						let entity = toCreate[key][i];
 						entity = foundry.utils.mergeObject(prototypeAttached[key][i], entity);
 						delete entity._id;
+						if(TokenAttacher.isV14() && (key === "Region")){
+							entity.attachment ??= {};
+							entity.attachment.token = baseDocument._id ?? null;
+							if(baseDocument._id) foundry.utils.setProperty(entity, `flags.${moduleName}.parent`, baseDocument._id);
+						}
 						toCreate[key][i] = entity;
 					}
 
@@ -1890,7 +2229,7 @@ import {libWrapper} from './shim.js';
 						for (let i = 0; i < toCreate[key].length; i++) {
 							const element = toCreate[key][i];
 							if(element.img){
-								element.texture = {src: element.img};
+								element.texture = {...element.texture, src: element.img};
 								delete element.img;
 							}
 							if(element.texture?.src && element.texture?.src !== "" && element.texture?.src !== null) promises.push(loadTexture(element.texture?.src, {fallback: 'icons/svg/hazard.svg'}));
@@ -1902,7 +2241,7 @@ import {libWrapper} from './shim.js';
 						for (let i = 0; i < toCreate[key].length; i++) {
 							const element = toCreate[key][i];
 							if(element.img){
-								element.texture = {src: element.img};
+								element.texture = {...element.texture, src: element.img};
 								delete element.img;
 							}
 							if(element.texture?.src && element.texture?.src !== "" && element.texture?.src !== null) promises.push(loadTexture(element.texture?.src, {fallback: 'icons/svg/hazard.svg'}));
@@ -1950,11 +2289,12 @@ import {libWrapper} from './shim.js';
 										const attached_element = new_attached[type][j];	
 										let update =  {_id: attached_element._id};	
 										update[`flags.${moduleName}.parent`] = baseDoc._id;
+										if(TokenAttacher.isV14() && (type === "Region")) update["attachment.token"] = baseDoc._id;
 										pushUpdate(type, update, updates);
 									}
 									new_attached[type] = new_attached[type].map(doc => doc._id);
 									if(current_attached && current_attached.hasOwnProperty(type)){
-										current_attached[type] = current_attached[type].filter(item => foundry.utils.getProperty(TokenAttacher.layerGetElement(type, item).document , `flags.${moduleName}.parent`) === baseDoc._id);
+										current_attached[type] = current_attached[type].filter(item => foundry.utils.getProperty(TokenAttacher.getElementDocument(type, item), `flags.${moduleName}.parent`) === baseDoc._id);
 										new_attached[type] = [...new Set(new_attached[type].concat(current_attached[type]))];
 									}
 									if(new_attached[type].length <= 0) delete new_attached[type];
@@ -1989,7 +2329,7 @@ import {libWrapper} from './shim.js';
 
 					const child = foundry.utils.getProperty(options, `${moduleName}.base`);
 
-					let subUpdates = await TokenAttacher._AttachToToken(element,{type:child.type, ids:[child._id]},true , true);
+					let subUpdates = await TokenAttacher._AttachToToken(element,{type:child.type, ids:[child.doc?._id]},true , true);
 					for (const key in subUpdates) {
 						if (subUpdates.hasOwnProperty(key)) {
 							const updateArray = subUpdates[key];
@@ -2005,19 +2345,18 @@ import {libWrapper} from './shim.js';
 			//Fire updates
 			for (const key in updates){
 				if (updates.hasOwnProperty(key)) {
-					await canvas.scene.updateEmbeddedDocuments(key, updates[key], {[moduleName]:{update:true}});
+					await TokenAttacher.updateEmbeddedDocuments(key, updates[key], {[moduleName]:{update:true}});
 				}
 			}
 			//Fire After updates
 			for (const key in afterUpdates){
 				if (afterUpdates.hasOwnProperty(key)) {
-					await canvas.scene.updateEmbeddedDocuments(key, afterUpdates[key], {[moduleName]:{update:true}});
+					await TokenAttacher.updateEmbeddedDocuments(key, afterUpdates[key], {[moduleName]:{update:true}});
 				}
 			}
 		}
 
 		static async deleteMissingLinks(){		
-			const base_layer = 	canvas.getLayerByEmbeddedName("Token");
 			let deletes = {};
 			const pushUpdate = (key, update, updateObj) => {
 				if(!updateObj.hasOwnProperty(key)) updateObj[key] = [];
@@ -2025,21 +2364,12 @@ import {libWrapper} from './shim.js';
 				if(dupIndex === -1) updateObj[key].push(update);
 			};
 			for (const type of TokenAttacher.registeredLayers) {
-				const layer = canvas.getLayerByEmbeddedName(type) ?? TokenAttacher.getLayerByEmbeddedName(type);
-				if(!layer) continue;
-				const deleteLinks = (layer) => {
-						for (let i = 0; i < layer.placeables.length; i++) {
-							const element = layer.placeables[i];
-							if(foundry.utils.getProperty(element.document, `flags.${moduleName}.needsPostProcessing`)) pushUpdate(type, element.document._id, deletes);
-							else if(foundry.utils.getProperty(element.document, `flags.${moduleName}.parent`)){
-								const base = base_layer.get(foundry.utils.getProperty(element.document, `flags.${moduleName}.parent`));
-								if(!base) pushUpdate(type, element.document._id, deletes);
-							}
-						}
+				for(const document of TokenAttacher.getSceneDocuments(type)){
+					if(foundry.utils.getProperty(document, `flags.${moduleName}.needsPostProcessing`)) pushUpdate(type, document._id, deletes);
+					else if(foundry.utils.getProperty(document, `flags.${moduleName}.parent`)){
+						const base = canvas.scene.tokens.get(foundry.utils.getProperty(document, `flags.${moduleName}.parent`));
+						if(!base) pushUpdate(type, document._id, deletes);
 					}
-				deleteLinks(layer);
-				if(type === "Tile" && canvas.foreground){
-					deleteLinks(canvas.foreground);
 				}
 			}
 			//Fire deletes
@@ -2072,6 +2402,7 @@ import {libWrapper} from './shim.js';
 
 		static async regenerateAttachedFromHistory(token, attached){
 			TokenAttacher.detectGM();
+			const tokenDocument = token.document ?? token;
 			const newattached= {};
 			for (const key in attached) {
 				if (attached.hasOwnProperty(key) && attached[key].length > 0) {
@@ -2080,21 +2411,21 @@ import {libWrapper} from './shim.js';
 					const undone = await layer.undoHistory();
 					if(Array.isArray(undone)){
 						newattached[key] = undone.map((obj)=>{
-							return obj.document._id;
-						});
+							return obj.id ?? obj.document?._id;
+						}).filter(Boolean);
 					}
 					else{
-						newattached[key] = [undone.document._id];
+						newattached[key] = [undone?.id ?? undone?.document?._id].filter(Boolean);
 					}
 				}
 			}
 			
-			await token.document.unsetFlag(moduleName, `attached`);
-			await token.document.setFlag(moduleName, `attached`, newattached);
+			await tokenDocument.unsetFlag(moduleName, `attached`);
+			await tokenDocument.setFlag(moduleName, `attached`, newattached);
 		}
 
 		static mapActorForExport(actor){
-			return {img:actor.img, name:actor.name, folder:actor.folder || null, prototypeToken: actor.prototypeToken, flags: actor.flags};
+			return {img:actor.img, name:actor.name, folder:actor.folder?.id ?? actor._source?.folder ?? null, prototypeToken: actor.prototypeToken, flags: actor.flags};
 		}
 
 		static async getActorsWithPrototype(){
@@ -2107,7 +2438,7 @@ import {libWrapper} from './shim.js';
 			const allMappedActors = allActors.map(TokenAttacher.mapActorForExport);
 
 			let addParentFolder = (folders, folder) =>{
-				const parent = game.folders.get(folder.parent) || null;
+				const parent = folder.folder || null;
 				if(parent){
 					folders[parent._id] = parent;
 					addParentFolder(folders, parent);
@@ -2168,11 +2499,10 @@ import {libWrapper} from './shim.js';
 
 			//folders in compendium
 			actors.forEach(actor => {
-				const folder = actor.folder || null;
+				const folder = pack.folders?.get(actor.folder) ?? game.folders.get(actor.folder) ?? null;
 				if(folder){
 					folders[folder._id] = folder;
 					addParentFolder(folders, folder);
-					actor.folder = actor.folder._id;
 				}
 			});
 
@@ -2219,8 +2549,8 @@ import {libWrapper} from './shim.js';
 
 		static getDefaultActorForSystem(){
 			let actorType;
-			let documentTypes = game.system.documentTypes?.Actor ?? game.system.template.Actor;
-			let typesArray = Object.keys(documentTypes);
+			let documentTypes = game.documentTypes?.Actor ?? game.system.documentTypes?.Actor ?? [];
+			let typesArray = Array.isArray(documentTypes) ? documentTypes : Object.keys(documentTypes);
 			if(game.system.id == 'wfrp4e') actorType = typesArray.find(a => a == 'character');
 			if(!actorType) actorType = typesArray.find(a => a == 'npc');
 			if(!actorType) actorType = typesArray[0]
@@ -2237,12 +2567,13 @@ import {libWrapper} from './shim.js';
 				if (folders.hasOwnProperty(key)) {
 					const folder = folders[key];
 					allPromises.push((async (folder)=>{
-						if(!parentMap.hasOwnProperty(folder.parent)) {
+						const parentId = folder.folder ?? folder.parent ?? null;
+						if(!parentMap.hasOwnProperty(parentId)) {
 							let resolver;
-							parentMap[folder.parent] = {value:new Promise((resolve)=>{resolver = resolve}), signal: resolver};
+							parentMap[parentId] = {value:new Promise((resolve)=>{resolver = resolve}), signal: resolver};
 						}
-						const parent = await parentMap[folder.parent].value;
-						const newFolder = await Folder.create({name: folder.name, type: "Actor", parent: parent});
+						const parent = await parentMap[parentId].value;
+						const newFolder = await Folder.create({name: folder.name, type: "Actor", folder: parent});
 						if(!parentMap.hasOwnProperty(folder._id)) {
 							parentMap[folder._id] = {value:new Promise((resolve) => (resolve(newFolder._id)))};
 						}
@@ -2254,9 +2585,7 @@ import {libWrapper} from './shim.js';
 			}
 			await Promise.all(allPromises);
 			const actorType = TokenAttacher.getDefaultActorForSystem();
-			actors.forEach(async actor => {
-				await Actor.create({type: actorType, img:actor.img, name:actor.name, folder:await parentMap[actor.folder].value, prototypeToken: actor.prototypeToken ?? actor.token, flags: actor.flags});
-			});
+			await Promise.all(actors.map(async actor => Actor.create({type: actorType, img:actor.img, name:actor.name, folder:await parentMap[actor.folder ?? null].value, prototypeToken: actor.prototypeToken ?? actor.token, flags: actor.flags})));
 		}
 
 		static async importFromJSONWithCompendium(imported, options={}){
@@ -2359,24 +2688,21 @@ import {libWrapper} from './shim.js';
 		static isAllowedToMove(type, document, change, options, userId){
 			//Ignore anything from anyone not in your scene
 			if(game.users.find(u => u._id ==userId)?.viewedScene != game.user.viewedScene) return;
+			const positionChanged = change.hasOwnProperty("x")
+				|| change.hasOwnProperty("y")
+				|| change.hasOwnProperty("c")
+				|| change.hasOwnProperty("rotation")
+				|| ((type === "Region") && change.hasOwnProperty("shapes"));
 			
-			if(	(		change.hasOwnProperty("x")
-					||	change.hasOwnProperty("y")
-					||	change.hasOwnProperty("c")
-					||	change.hasOwnProperty("rotation")
-					||	Object.keys(change).length == 0)
+			if(	(positionChanged || Object.keys(change).length == 0)
 				&&	foundry.utils.getProperty(document, `flags.${moduleName}.needsPostProcessing`) 
 				&& !foundry.utils.getProperty(options, `${moduleName}`)) {				
 				ui.notifications.error(game.i18n.format(localizedStrings.error.PostProcessingNotFinished));
 				return false;
 			}
 
-			if(!(	change.hasOwnProperty("x")
-				||	change.hasOwnProperty("y")
-				||	change.hasOwnProperty("c")
-				||	change.hasOwnProperty("rotation"))){
-				return true;
-			}
+			if(!positionChanged) return true;
+			if(options._attachedRegions) return true;
 
 			let animate = foundry.utils.getProperty(document, `flags.${moduleName}.animate`) ?? true;
 			if(!animate) foundry.utils.setProperty(options, `animate`, animate);
@@ -2476,6 +2802,8 @@ import {libWrapper} from './shim.js';
 				||	change.hasOwnProperty("direction")
 				||	change.hasOwnProperty("width")
 				||	change.hasOwnProperty("height")
+				||	change.hasOwnProperty("shape")
+				||	change.hasOwnProperty("level")
 				||	change.hasOwnProperty("radius")
 				||	change.hasOwnProperty("dim")
 				||	change.hasOwnProperty("bright")
@@ -2561,30 +2889,29 @@ import {libWrapper} from './shim.js';
 			//Ignore anything from anyone not in your scene
 			if(game.users.find(u => u._id ==userId)?.viewedScene != game.user.viewedScene) return;
 			
-			if(TokenAttacher.isFirstActiveGM()) return;
 			let objParent = foundry.utils.getProperty(document, `flags.${moduleName}.parent`) || "";
 			if(!objParent) return;
 			if(foundry.utils.getProperty(options, "isUndo") === true){
 				if(foundry.utils.getProperty(options, "mlt_bypass") === true) return;
 
-				if(TokenAttacher.isFirstActiveGM()) TokenAttacher._ReattachAfterUndo(type, document, options, userId);
+				if(TokenAttacher.isFirstActiveGM()) return TokenAttacher._ReattachAfterUndo(type, document, options, userId);
 				else game.socket.emit(`module.${moduleName}`, {event: `ReattachAfterUndo`, eventdata: [type, document, options, userId]});
 			}
 			return;
 		}
 
 		//Reattach elements that are recreated via Undo or remove the attachment completly if the base doesn't exist anymore
-		static async _ReattachAfterUndo(type, parent, entity, options, userId){
+		static async _ReattachAfterUndo(type, entity, options, userId){
 			let objParent = foundry.utils.getProperty(entity, `flags.${moduleName}.parent`) || "";
-			const parent_token = canvas.tokens.get(objParent);
+			const parent_token = canvas.scene.tokens.get(objParent);
 			if(parent_token){
-				TokenAttacher._AttachToToken(parent_token, {type:type, ids:[entity._id]}, true);
+				await TokenAttacher._AttachToToken(parent_token, {type:type, ids:[entity._id]}, true);
 			}
 			else{
-				const element = TokenAttacher.layerGetElement(type, entity._id);
+				const element = TokenAttacher.getElementDocument(type, entity._id);
 				
 				const deletes ={[`flags.-=${moduleName}`]: null};
-				await element.update(deletes);
+				await element?.update(deletes);
 			}
 		}
 
@@ -2606,7 +2933,9 @@ import {libWrapper} from './shim.js';
 					if(!layer) return;
 					//if (layer.options.controllableObjects) {
 						// Identify controllable objects
-						const controllable = layer.placeables.filter(obj => obj.visible && (obj.control instanceof Function));
+						const controllable = layer.placeables.filter(obj => !obj.document.locked
+							&& ((type === "Region") || obj.visible)
+							&& (obj.control instanceof Function));
 						const newSet = controllable.filter(obj => {
 							let c = obj.center;
 							//filter base out
@@ -2627,25 +2956,26 @@ import {libWrapper} from './shim.js';
 					selectAll(canvas.foreground);
 				}
 			}
-			if(selected.length === 0) return;
+			if(Object.keys(selected).length === 0) return;
 			TokenAttacher._attachElementsToToken(selected, token, false);
 			ui.notifications.info(game.i18n.format(localizedStrings.info.ObjectsAttached));
 		}
 
 		static areDuplicatesInAttachChain(base, attached){
 			//Check if base tried to attach itself
-			const type = base.layer.constructor.documentName;
+			const baseDocument = base.document ?? base;
+			const type = base.layer?.constructor.documentName ?? baseDocument.documentName;
 			const att = foundry.utils.getProperty(attached, type) || [];
-			if(att.indexOf(base.document._id) !== -1) return base;
+			if(att.indexOf(baseDocument._id) !== -1) return base;
 
 			let bases = {};
-			let duplicate = null;
 			//Add base to bases object and return true when no duplicate was found
-			const add_base = (element) => {
-				const type = element.layer.constructor.documentName;
+			const add_base = (element, documentType) => {
+				const document = element.document ?? element;
+				const type = documentType ?? element.layer?.constructor.documentName ?? document.documentName;
 				if(!bases.hasOwnProperty(type)) bases[type] = {};
-				if(!bases[type].hasOwnProperty(element.document._id)){
-					bases[type][element.document._id] = 1;
+				if(!bases[type].hasOwnProperty(document._id)){
+					bases[type][document._id] = 1;
 					return true;
 				}
 				return false;
@@ -2656,11 +2986,11 @@ import {libWrapper} from './shim.js';
 			for (const key in attached) {
 				if (attached.hasOwnProperty(key) && key !== "unknown") {
 					for (const elementid of attached[key]) {
-						let element = TokenAttacher.layerGetElement(key, elementid);
+						let element = TokenAttacher.getElementDocument(key, elementid);
 						if(element){
-							const elementAttached = element.document.getFlag(moduleName, "attached") || {};
+							const elementAttached = element.getFlag(moduleName, "attached") || {};
 							if(Object.keys(elementAttached).length > 0){
-								if(!add_base(element)){
+								if(!add_base(element, TokenAttacher.normalizeDocumentType(key))){
 									return element;
 								}
 							}
@@ -2678,6 +3008,16 @@ import {libWrapper} from './shim.js';
 
 			//Tokens are a special case because their center depends on the type of grid
 			if(type == "Token"){
+				if(TokenAttacher.isV14()){
+					let tokenDocument = objData instanceof CONFIG.Token.documentClass ? objData : canvas.scene?.tokens?.get(objData._id);
+					try {
+						tokenDocument ??= new CONFIG.Token.documentClass(objData, {parent: canvas.scene});
+						return tokenDocument.getCenterPoint(objData);
+					}
+					catch(error){
+						console.warn("Token Attacher | Falling back to legacy Token center calculation.", error);
+					}
+				}
 				if(canvas.grid.type == CONST.GRID_TYPES.GRIDLESS || canvas.grid.type == CONST.GRID_TYPES.SQUARE){
 					let [width, height] = [objData.width * grid.sizeX, objData.height * grid.sizeY]
 					center={x:x + (Math.abs(width) / 2), y:y + (Math.abs(height) / 2)};
@@ -2709,6 +3049,17 @@ import {libWrapper} from './shim.js';
 					};
 					return center;
 				}
+			}
+
+			//V14 Tile x/y is an anchor pivot, not always the top-left corner.
+			if(TokenAttacher.isV14() && (type === "Tile") && (objData.texture?.anchorX !== undefined) && (objData.texture?.anchorY !== undefined)){
+				const a = Math.toRadians(objData.rotation ?? 0);
+				const dx = (0.5 - objData.texture.anchorX) * objData.width;
+				const dy = (0.5 - objData.texture.anchorY) * objData.height;
+				return {
+					x: x + ((Math.cos(a) * dx) - (Math.sin(a) * dy)),
+					y: y + ((Math.sin(a) * dx) + (Math.cos(a) * dy))
+				};
 			}
 
 			//Tiles
@@ -2864,11 +3215,11 @@ import {libWrapper} from './shim.js';
 					foundry.utils.setProperty(element, `flags.${moduleName}.offset`, {});
 					return {_id:elem._id, [`flags.${moduleName}.offset`]: elem.offset};
 				});
-				updates[key].filter(elem=> elem._id != "undefined");
+				updates[key] = updates[key].filter(elem=> elem._id !== "undefined");
 			}
 			//Fire all updates by type
 			for (const key in updates) { 
-				await canvas.scene.updateEmbeddedDocuments(key, updates[key], {[moduleName]:{update:true}});
+				await TokenAttacher.updateEmbeddedDocuments(key, updates[key], {[moduleName]:{update:true}});
 			}
 		}
 
@@ -2888,18 +3239,21 @@ import {libWrapper} from './shim.js';
 					clearTimeout(quickEdit.timer);
 					const parent_type = "Token";
 					const parent_id = foundry.utils.getProperty(document, `flags.${moduleName}.parent`);
-					let parent = TokenAttacher.layerGetElement(parent_type, parent_id);
-					TokenAttacher.updateOffsetOfElement(quickEdit, parent_type, parent.document, type, document._id);
+					const parent = TokenAttacher.getElementDocument(parent_type, parent_id);
+					if(!parent) return;
+					TokenAttacher.updateOffsetOfElement(quickEdit, parent_type, parent, type, document._id);
 					quickEdit.timer = setTimeout(TokenAttacher.saveAllQuickEditOffsets, 1000);
 				}
 			}
 		}
 
 		static updateOffsetOfElement(quickEdit, base_type, base_data, type, element_id){
-			let element = TokenAttacher.layerGetElement(type, element_id);
-			const new_offset = TokenAttacher.getElementOffset(type, element.document, base_type, base_data, {});
+			type = TokenAttacher.normalizeDocumentType(type);
+			const element = TokenAttacher.getElementDocument(type, element_id);
+			if(!element) return;
+			const new_offset = TokenAttacher.getElementOffset(type, element, base_type, base_data, {});
 			//set offset locally only so the user see's the effects immediatly
-			foundry.utils.setProperty(element.document, `flags.${moduleName}.offset`, new_offset);
+			foundry.utils.setProperty(element, `flags.${moduleName}.offset`, new_offset);
 			if(!foundry.utils.getProperty(quickEdit, `elements.${type}`)) quickEdit.elements[type] = [];
 			const elemIndex = quickEdit.elements[type].findIndex(item => item._id === element_id);
 			if(elemIndex === -1) quickEdit.elements[type].push({_id:element_id, offset:new_offset});
@@ -2908,14 +3262,15 @@ import {libWrapper} from './shim.js';
 
 		
 		static _quickEditUpdateOffsetsOfBase(quickEdit, type, base_data){
-			let attached = foundry.utils.getProperty(base_data, `flags.${moduleName}.attached`);
+			let attached = foundry.utils.getProperty(base_data, `flags.${moduleName}.attached`) || {};
 			for (const key in attached) { 
 				for (let i = 0; i < attached[key].length; i++) {
 					const element_id = attached[key][i];
-					let element =TokenAttacher.layerGetElement(key, element_id);
+					const element = TokenAttacher.getElementDocument(key, element_id);
+					if(!element) continue;
 					TokenAttacher.updateOffsetOfElement(quickEdit, type, base_data, key, element_id);
-					if(element.document.getFlag(moduleName, 'attached')){
-						TokenAttacher._quickEditUpdateOffsetsOfBase(key, element);
+					if(element.getFlag(moduleName, 'attached')){
+						TokenAttacher._quickEditUpdateOffsetsOfBase(quickEdit, TokenAttacher.normalizeDocumentType(key), element);
 					}
 				}
 
@@ -2935,6 +3290,7 @@ import {libWrapper} from './shim.js';
 		}
 
 		static getLayerOrCollection(key){
+			key = TokenAttacher.normalizeDocumentType(key);
 			return canvas.getLayerByEmbeddedName(key) ?? TokenAttacher.getLayerByEmbeddedName(key) ?? game.collections.get(key);
 		}
 
@@ -2942,7 +3298,7 @@ import {libWrapper} from './shim.js';
 			let updates = tokens.map(elem =>{
 				return {_id:elem.document._id, [`flags.${moduleName}.animate`]: animate};
 			});
-			await canvas.scene.updateEmbeddedDocuments(tokens[0].layer.constructor.documentName, updates, {[moduleName]:{update:true}});
+			await TokenAttacher.updateEmbeddedDocuments(tokens[0].layer.constructor.documentName, updates, {[moduleName]:{update:true}});
 			if(!suppressNotification) ui.notifications.info(game.i18n.format(localizedStrings.info.AnimationToggled, {count: tokens.length}));
 		}
 
@@ -2950,17 +3306,41 @@ import {libWrapper} from './shim.js';
 			let updates = tokens.map(elem =>{
 				return {_id:elem.document._id, [`flags.${moduleName}.animate`]: !(elem.document.getFlag(moduleName,`animate`) ?? true)};
 			});
-			await canvas.scene.updateEmbeddedDocuments(tokens[0].layer.constructor.documentName, updates, {[moduleName]:{update:true}});
+			await TokenAttacher.updateEmbeddedDocuments(tokens[0].layer.constructor.documentName, updates, {[moduleName]:{update:true}});
 			if(!suppressNotification) ui.notifications.info(game.i18n.format(localizedStrings.info.AnimationToggled, {count: tokens.length}));
 		}
 
 		static layerGetElement(layer, id){
+			layer = TokenAttacher.normalizeDocumentType(layer);
 			const layerObj = canvas.getLayerByEmbeddedName(layer) ?? TokenAttacher.getLayerByEmbeddedName(layer);
 			const foreground = canvas.foreground ?? layerObj;
 			let result = {element:null};
-			if(layer) result.element = layerObj.get(id) ?? foreground.get(id);
+			if(layer) result.element = layerObj?.get?.(id) ?? foreground?.get?.(id);
 			if(!result.element) Hooks.callAll(`${moduleName}.layerGetElement`, layer, id, result);
 			return result.element;
+		}
+
+		static getElementDocument(type, id){
+			type = TokenAttacher.normalizeDocumentType(type);
+			try {
+				const document = canvas.scene?.getEmbeddedDocument(type, id);
+				if(document) return document;
+			}
+			catch(error){
+				// Compatibility layers may not be core embedded document types.
+			}
+			return TokenAttacher.layerGetElement(type, id)?.document ?? null;
+		}
+
+		static getSceneDocuments(type){
+			type = TokenAttacher.normalizeDocumentType(type);
+			try {
+				return [...canvas.scene.getEmbeddedCollection(type)];
+			}
+			catch(error){
+				const layer = canvas.getLayerByEmbeddedName(type) ?? TokenAttacher.getLayerByEmbeddedName(type);
+				return (layer?.placeables || []).map(element => element.document);
+			}
 		}
 
 		static async migrateElementsInCompendiums(migrateFunc, elementTypes, topLevelOnly){
@@ -3067,7 +3447,6 @@ import {libWrapper} from './shim.js';
 		}
 
 		static async purgeTAData(){		
-			const base_layer = 	canvas.getLayerByEmbeddedName("Token");
 			const moduleName = 'token-attacher';
 			let updates = {};
 			const pushUpdate = (key, update, updateObj) => {
@@ -3076,23 +3455,19 @@ import {libWrapper} from './shim.js';
 				if(dupIndex === -1) updateObj[key].push(update);
 			};
 			for (const type of TokenAttacher.registeredLayers) {
-				const layer = canvas.getLayerByEmbeddedName(type) ?? TokenAttacher.getLayerByEmbeddedName(type);
-				const deleteLinks = (layer) => {
-						if(!layer) return;
-						for (let i = 0; i < layer.placeables.length; i++) {
-							const element = layer.placeables[i];
-							if(foundry.utils.getProperty(element.document, `flags.${moduleName}`)) pushUpdate(type, {_id:element.document._id, [`flags.-=${moduleName}`]:null}, updates);
-						}
+				for(const document of TokenAttacher.getSceneDocuments(type)){
+					if(!foundry.utils.getProperty(document, `flags.${moduleName}`)) continue;
+					const update = {_id: document._id, [`flags.-=${moduleName}`]: null};
+					if(TokenAttacher.isV14() && (type === "Region") && document._source?.attachment?.token){
+						update["attachment.token"] = null;
 					}
-				deleteLinks(layer);
-				if(type === "Tile" && canvas.foreground){
-					deleteLinks(canvas.foreground);
+					pushUpdate(type, update, updates);
 				}
 			}
 			//Fire updates
 			for (const key in updates){
 				if (updates.hasOwnProperty(key)) {
-					await canvas.scene.updateEmbeddedDocuments(key, updates[key], {[moduleName]:{update:true}});
+					await TokenAttacher.updateEmbeddedDocuments(key, updates[key], {[moduleName]:{update:true}});
 				}
 			}
 			console.log("All Token Attacher Data has been removed from scene.");
@@ -3103,12 +3478,16 @@ import {libWrapper} from './shim.js';
 		}
 
 		static async migrateAttached(type, baseElement, migrateFunc, elementTypes, topLevelOnly, return_data=false){
-			const attached=foundry.utils.getProperty(baseElement.document, `flags.${moduleName}.attached`) || {};
+			elementTypes = elementTypes.map(elementType => TokenAttacher.normalizeDocumentType(elementType));
+			const baseDocument = baseElement.document ?? baseElement;
+			const attached=foundry.utils.getProperty(baseDocument, `flags.${moduleName}.attached`) || {};
 			let attachedEntities = {};
 			
 			//Get Entities
 			for (const key in attached) {
-				attachedEntities[key] = attached[key].map(id => TokenAttacher.layerGetElement(key, id));
+				const documentType = TokenAttacher.normalizeDocumentType(key);
+				attachedEntities[documentType] ??= [];
+				attachedEntities[documentType].push(...attached[key].map(id => TokenAttacher.getElementDocument(documentType, id)).filter(Boolean));
 			}
 
 			let updates = {};
@@ -3118,7 +3497,7 @@ import {libWrapper} from './shim.js';
 				if (attachedEntities.hasOwnProperty(key)) {
 					if(elementTypes.includes(key)){
 						if(!updates.hasOwnProperty(key)) updates[key] = [];
-						updates[key] = await migrateFunc(key, attachedEntities[key].map(entity => foundry.utils.duplicate(entity.document)), baseElement.document);
+						updates[key] = await migrateFunc(key, attachedEntities[key].map(entity => foundry.utils.duplicate(entity)), baseDocument);
 						if(!updates[key]) delete updates[key];
 					}
 				}
@@ -3128,12 +3507,12 @@ import {libWrapper} from './shim.js';
 				if (attachedEntities.hasOwnProperty(key)) {
 					for (let i = 0; i < attachedEntities[key].length; i++) {
 						const element = attachedEntities[key][i];
-						const elem_id = element.document._id;
+						const elem_id = element._id;
 						
-						const elem_attached=foundry.utils.getProperty(element.document, `flags.${moduleName}.attached`) || {};
+						const elem_attached=foundry.utils.getProperty(element, `flags.${moduleName}.attached`) || {};
 						if(Object.keys(elem_attached).length > 0){
 							const elem_update = updates[key]?.find(item => item._id === elem_id );
-							const updatedElementData = foundry.utils.mergeObject(foundry.utils.duplicate(element.document), elem_update);
+							const updatedElementData = foundry.utils.mergeObject(foundry.utils.duplicate(element), elem_update);
 							const subUpdates = await TokenAttacher.migrateAttached(key, updatedElementData, migrateFunc, elementTypes, topLevelOnly, true);
 							for (const key in subUpdates) {
 								if(!updates.hasOwnProperty(key)) updates[key] = subUpdates[key];
@@ -3149,7 +3528,7 @@ import {libWrapper} from './shim.js';
 			
 			//Fire all updates by type
 			for (const key in updates) {
-				await canvas.scene.updateEmbeddedDocuments(key, updates[key], {[moduleName]:{update:true}});
+				await TokenAttacher.updateEmbeddedDocuments(key, updates[key], {[moduleName]:{update:true}});
 			}
 
 			return;
@@ -3163,14 +3542,13 @@ import {libWrapper} from './shim.js';
 
 		static InstantAttach(type, document,  options, userId){
 			if(!foundry.utils.getProperty(options, `${moduleName}.InstantAttach`)) return;
-			if(!foundry.utils.getProperty(options, `${moduleName}.InstantAttach.userId`) === userId) return;
+			if(foundry.utils.getProperty(options, `${moduleName}.InstantAttach.userId`) !== userId) return;
 			if(foundry.utils.getProperty(document,`flags.${moduleName}.prototypeAttached`)) return;
 			if(foundry.utils.getProperty(options,`${moduleName}.base`)) return;
 
 			const attach_base = canvas.scene.getFlag(moduleName, "attach_base");
-			let layer;
 			let element;
-			if(attachment_base){
+			if(attach_base){
 				element = TokenAttacher.layerGetElement(attach_base.type, attach_base.element);
 			}		
 
@@ -3180,10 +3558,11 @@ import {libWrapper} from './shim.js';
 				return;
 			}
 			
-			TokenAttacher._AttachToToken(element,{type:document.layer.constructor.documentName, ids:[document._id]});
+			TokenAttacher._AttachToToken(element,{type, ids:[document._id]});
 		}
 
 		static getLayerByEmbeddedName(type){
+			type = TokenAttacher.normalizeDocumentType(type);
 			return canvas.layers.find(l => l.constructor.documentName === type);
 		}
 
