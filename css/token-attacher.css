@@ -52,13 +52,8 @@
 	white-space: nowrap;
 	height: 20px;
 }
-#tokenAttacher ol{
-	list-style: none;
+#tokenAttacher .control-tools{
 	padding-left: 0.25em;
-}
-#tokenAttacher li{
-	height: 24px;
-	width: 24px;
 }
 #tokenAttacher .control-tool{
 	width: 36px;
@@ -74,6 +69,7 @@
 	border: 1px solid #000;
 	border-radius: 5px;
 	cursor: pointer;
+	padding: 0;
 }
 #tokenAttacher .control-tool:hover{
 	color: #FFF;
@@ -87,7 +83,7 @@
 	border-bottom: 1px solid #ff6400;
 	box-shadow: 0 0 10px #ff6400;
 }
-#tokenAttacher li i{
+#tokenAttacher .control-tool i{
 	height: 24px;
 	width: 24px;
 	line-height: 24px;
@@ -104,7 +100,7 @@
 	box-shadow: none;
 }
 
-#tokenAttacher li i.hidden{
+#tokenAttacher .control-tool i.hidden{
 	display: none;
 }
 
